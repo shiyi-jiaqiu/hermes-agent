@@ -1802,7 +1802,7 @@ class FeishuAdapter(BasePlatformAdapter):
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
             return None
-        return (
+        builder = (
             EventDispatcherHandler.builder(
                 self._encrypt_key,
                 self._verification_token,
@@ -1816,8 +1816,17 @@ class FeishuAdapter(BasePlatformAdapter):
                 lambda data: self._on_reaction_event("im.message.reaction.deleted_v1", data)
             )
             .register_p2_card_action_trigger(self._on_card_action_trigger)
-            .register_p2_application_bot_menu_v6(self._on_bot_menu_event)
-            .register_p2_im_chat_member_bot_added_v1(self._on_bot_added_to_chat)
+        )
+        register_bot_menu = getattr(builder, "register_p2_application_bot_menu_v6", None)
+        if callable(register_bot_menu):
+            builder = register_bot_menu(self._on_bot_menu_event)
+        else:
+            logger.warning(
+                "[Feishu] Installed lark-oapi does not support application.bot.menu_v6; "
+                "messages and /panel remain available, but the bot menu is disabled"
+            )
+        return (
+            builder.register_p2_im_chat_member_bot_added_v1(self._on_bot_added_to_chat)
             .register_p2_im_chat_member_bot_deleted_v1(self._on_bot_removed_from_chat)
             .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(self._on_p2p_chat_entered)
             .register_p2_im_message_recalled_v1(self._on_message_recalled)
@@ -2010,6 +2019,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_thread_loop = None
         self._loop = None
         self._event_handler = None
+        await self._panel_controller.close()
         self._shutdown_sdk_executor()
         self._persist_seen_message_ids()
         await self._release_app_lock()
@@ -2235,7 +2245,21 @@ class FeishuAdapter(BasePlatformAdapter):
                 replaced.revision = max(0, replaced.revision - 1)
                 self._panel_store.create_active(replaced)
             return result
-        self._panel_controller.attach_message_id(state, result.message_id or "")
+        attached = self._panel_controller.attach_message_id(state, result.message_id or "")
+        if not attached:
+            logger.warning(
+                "[Feishu Panel] failed to persist message id panel=%s message=%s",
+                state.panel_id,
+                result.message_id or "<missing>",
+            )
+        load_view = self._panel_controller._load_view_name(initial_view)
+        if load_view and load_view != "home":
+            if not self._panel_controller.schedule_view_load(state.panel_id, load_view):
+                logger.warning(
+                    "[Feishu Panel] failed to schedule initial view load panel=%s view=%s",
+                    state.panel_id,
+                    load_view,
+                )
         if replaced is not None and replaced.message_id:
             # Best-effort read-only replacement of the old card. Its server-side
             # active flag has already been revoked atomically.
@@ -3253,6 +3277,9 @@ class FeishuAdapter(BasePlatformAdapter):
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
+        if not self._is_interactive_operator_authorized(open_id):
+            logger.warning("[Feishu] Unauthorized approval click by %s", open_id or "<unknown>")
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
         sender_id = SimpleNamespace(open_id=open_id, user_id=str(getattr(operator, "user_id", "") or ""))
         if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
             logger.warning("[Feishu] Unauthorized approval click by %s", open_id or "<unknown>")
@@ -3313,6 +3340,9 @@ class FeishuAdapter(BasePlatformAdapter):
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
+        if not self._is_interactive_operator_authorized(open_id):
+            logger.warning("[Feishu] Unauthorized update prompt click by %s", open_id or "<unknown>")
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
         sender_id = SimpleNamespace(open_id=open_id, user_id=str(getattr(operator, "user_id", "") or ""))
         if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
             logger.warning("[Feishu] Unauthorized update prompt click by %s", open_id or "<unknown>")

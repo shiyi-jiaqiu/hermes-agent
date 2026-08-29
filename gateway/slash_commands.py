@@ -787,7 +787,10 @@ class GatewaySlashCommandsMixin:
         adapter = self._adapter_for_source(source)
         if adapter is None or getattr(type(adapter), "send_control_panel", None) is None:
             return "Interactive control panels are not supported on this platform."
-        status_text = await self._handle_status_command(event)
+        # The initial card intentionally excludes the expensive status view.
+        # Loading it here adds several session-DB reads before the card can be
+        # sent, only for create_panel_state() to discard the result.
+        status_text = ""
         metadata = self._thread_metadata_for_source(
             source,
             self._reply_anchor_for_event(event),
