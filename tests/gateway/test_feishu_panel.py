@@ -338,3 +338,52 @@ async def test_cached_provider_inventory_rebuilds_session_current_route() -> Non
     ]
     assert current == ["provider-b"]
     assert snapshot["_model_provider_inventory"][0]["is_current"] is False
+
+
+@pytest.mark.asyncio
+async def test_panel_mode_stays_selected_when_fast_is_enabled() -> None:
+    runner = _panel_runner()
+    runner._session_model_overrides["session-quick"] = {
+        "model": "gpt-5.6-luna",
+        "provider": "openai-codex",
+    }
+    runner._resolve_session_reasoning_config = MagicMock(
+        return_value={"enabled": True, "effort": "xhigh"}
+    )
+    runner._resolve_session_service_tier = MagicMock(return_value="priority")
+    service = HermesPanelControlService(runner)
+    source = SimpleNamespace(platform=SimpleNamespace(value="feishu"))
+
+    with patch.object(
+        service,
+        "_config",
+        return_value={
+            "model": {
+                "default": "gpt-5.6-luna",
+                "provider": "openai-codex",
+            },
+            "model_aliases": {
+                "luna": {
+                    "model": "gpt-5.6-luna",
+                    "provider": "openai-codex",
+                }
+            },
+            "mode_presets": {
+                "quick": {
+                    "model": "luna",
+                    "reasoning": "xhigh",
+                    "fast_mode": False,
+                }
+            },
+        },
+    ):
+        snapshot = await service.snapshot(
+            source=source,
+            session_key="session-quick",
+            include_catalog=False,
+            include_sessions=False,
+            include_status=False,
+        )
+
+    assert snapshot["fast_mode"] is True
+    assert snapshot["current_preset"] == "quick"

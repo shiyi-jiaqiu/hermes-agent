@@ -402,10 +402,11 @@ class HermesPanelControlService:
                         "fast_mode": preset_fast_mode,
                     }
                 )
+                # Fast is an orthogonal modifier shared by every mode. A mode
+                # remains selected when Fast is toggled independently.
                 if (
                     preset_model == effective_model
                     and preset_reasoning == effective_reasoning
-                    and preset_fast_mode == fast_mode
                 ):
                     current_preset = str(name)
 

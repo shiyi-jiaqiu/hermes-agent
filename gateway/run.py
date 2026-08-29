@@ -18173,6 +18173,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "fast":
             return await self._handle_fast_command(event)
 
+        if canonical == "mode":
+            return await self._handle_mode_command(event)
+
         if canonical == "verbose":
             return await self._handle_verbose_command(event)
 
