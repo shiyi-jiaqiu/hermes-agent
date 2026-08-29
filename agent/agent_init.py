@@ -2262,6 +2262,17 @@ def init_agent(
         }
     else:
         compression_model_thresholds = {}
+    # Per-model absolute token caps. These are applied after the built-in
+    # small-context safety floor, so an explicit operator value can request a
+    # lower trigger for one model without weakening the floor globally.
+    _raw_model_threshold_tokens = _compression_cfg.get("model_threshold_tokens", {})
+    if isinstance(_raw_model_threshold_tokens, dict):
+        compression_model_threshold_tokens = {
+            str(k): int(v) for k, v in _raw_model_threshold_tokens.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and int(v) > 0
+        }
+    else:
+        compression_model_threshold_tokens = {}
     # Absolute token cap: when set, compression triggers at the lower of
     # the ratio-based threshold and this absolute count. Clamped to the
     # model's context length at apply-time so a cap above the window is
@@ -2788,6 +2799,7 @@ def init_agent(
             max_tokens=agent.max_tokens,
             model_thresholds=compression_model_thresholds,
             threshold_tokens_cap=compression_threshold_tokens,
+            model_threshold_tokens=compression_model_threshold_tokens,
             proactive_prune_tokens=compression_proactive_prune_tokens,
             proactive_prune_min_result_chars=compression_proactive_prune_min_chars,
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,

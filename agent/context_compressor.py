@@ -2993,6 +2993,11 @@ class ContextCompressor(ContextEngine):
         # passes the new value explicitly. (#43547)
         if max_tokens is not None:
             self.max_tokens = self._coerce_max_tokens(max_tokens)
+        self.threshold_tokens_cap = self._resolve_model_threshold_tokens_cap(
+            model,
+            getattr(self, "model_threshold_tokens", {}),
+            getattr(self, "_global_threshold_tokens_cap", None),
+        )
         self.threshold_tokens = self._compute_threshold_tokens(
             context_length, self.threshold_percent, self.max_tokens,
         )
@@ -3114,6 +3119,31 @@ class ContextCompressor(ContextEngine):
             return None
         return ivalue if ivalue > 0 else None
 
+    @classmethod
+    def _resolve_model_threshold_tokens_cap(
+        cls,
+        model: str,
+        model_threshold_tokens: dict[str, int] | None,
+        default: Any,
+    ) -> int | None:
+        """Resolve a per-model absolute compression trigger cap.
+
+        Keys use the same longest-substring matching contract as
+        ``model_thresholds``. An absent/invalid match falls back to the global
+        ``compression.threshold_tokens`` value.
+        """
+        fallback = cls._coerce_threshold_tokens_cap(default)
+        if not model_threshold_tokens or not model:
+            return fallback
+        best_key = ""
+        for key in model_threshold_tokens:
+            key_text = str(key)
+            if key_text in model and len(key_text) > len(best_key):
+                best_key = key_text
+        if not best_key:
+            return fallback
+        return cls._coerce_threshold_tokens_cap(model_threshold_tokens[best_key]) or fallback
+
     def _apply_threshold_tokens_cap(self) -> None:
         """Apply the absolute token cap if configured.
 
@@ -3204,6 +3234,7 @@ class ContextCompressor(ContextEngine):
         max_tokens: int | None = None,
         model_thresholds: dict[str, float] | None = None,
         threshold_tokens_cap: Any = None,
+        model_threshold_tokens: dict[str, int] | None = None,
         proactive_prune_tokens: int = 0,
         proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096,
@@ -3232,13 +3263,16 @@ class ContextCompressor(ContextEngine):
             model, self.model_thresholds, threshold_percent,
         )
         self.threshold_percent = self._base_threshold_percent
-        # Absolute token cap from config (compression.threshold_tokens). When
-        # set, the effective trigger point is min(ratio-based threshold, cap)
-        # so compression never fires later than the user's preferred token
-        # count regardless of which model is active. Applied in __init__ and
-        # re-applied in update_model() so it survives model switches/fallbacks.
-        self.threshold_tokens_cap = self._coerce_threshold_tokens_cap(
+        # Per-model absolute threshold caps use the same longest-match rule.
+        # The global cap remains the fallback for models without an override.
+        self.model_threshold_tokens = model_threshold_tokens or {}
+        self._global_threshold_tokens_cap = self._coerce_threshold_tokens_cap(
             threshold_tokens_cap,
+        )
+        self.threshold_tokens_cap = self._resolve_model_threshold_tokens_cap(
+            model,
+            self.model_threshold_tokens,
+            self._global_threshold_tokens_cap,
         )
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
