@@ -18435,6 +18435,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "mode":
             return await self._handle_mode_command(event)
+
         if canonical == "approvals":
             return await self._handle_approvals_command(event)
 
