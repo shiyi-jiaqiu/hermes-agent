@@ -17158,6 +17158,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return {
             "status": self._handle_status_command,
             "context": self._handle_context_command,
+            "panel": self._handle_panel_command,
             "restart": self._handle_restart_command,
             "approve": self._handle_approve_command,
             "deny": self._handle_deny_command,
