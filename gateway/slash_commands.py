@@ -3924,6 +3924,178 @@ class GatewaySlashCommandsMixin:
             logger.warning("send_choice_picker failed, falling back to text: %s", e)
             return False
 
+    async def _handle_mode_command(self, event: MessageEvent) -> str:
+        """Atomically apply a configured model/reasoning preset.
+
+        ``/mode quick [fast]`` and the direct aliases ``/quick [fast]``,
+        ``/daily [fast]``, and ``/deep [fast]`` share this handler. Omitting
+        ``fast`` explicitly selects Normal mode, so any alias can also turn a
+        prior session-scoped Fast selection off.
+        """
+        from gateway.run import _hermes_home, _load_gateway_config
+
+        source = await asyncio.to_thread(
+            self._normalize_source_for_session_key, event.source
+        )
+        session_key = self._session_key_for_source(source)
+        profile_home = None
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            profile_home = self._resolve_profile_home_for_source(source)
+        cfg = _load_gateway_config(
+            config_path=(profile_home or _hermes_home) / "config.yaml"
+        ) or {}
+        raw_presets = cfg.get("mode_presets")
+        presets = dict(raw_presets) if isinstance(raw_presets, dict) else {}
+
+        raw_command = str(event.get_command() or "").strip().lower()
+        words = shlex.split(event.get_command_args().strip())
+        if raw_command == "mode":
+            if not words:
+                available = ", ".join(str(name) for name in presets) or "none configured"
+                return (
+                    "Usage: `/mode <name> [fast]`\n"
+                    f"Configured modes: {available}"
+                )
+            mode_name = words.pop(0).lower()
+        else:
+            mode_name = raw_command
+
+        fast = False
+        if words:
+            if len(words) != 1 or words[0].lower() not in {"fast", "normal", "off"}:
+                return f"Usage: `/{mode_name} [fast]`"
+            fast = words[0].lower() == "fast"
+
+        selected = presets.get(mode_name)
+        if not isinstance(selected, dict):
+            available = ", ".join(str(name) for name in presets) or "none configured"
+            return f"Unknown mode `{mode_name}`. Configured modes: {available}"
+        model_target = str(selected.get("model") or "").strip()
+        reasoning = str(selected.get("reasoning") or "").strip().lower()
+        if not model_target or not reasoning:
+            return f"Mode `{mode_name}` must configure both model and reasoning."
+
+        raw_aliases = cfg.get("model_aliases")
+        aliases = dict(raw_aliases) if isinstance(raw_aliases, dict) else {}
+        alias_spec = aliases.get(model_target)
+        if isinstance(alias_spec, dict):
+            expected_model = str(alias_spec.get("model") or model_target)
+        elif alias_spec:
+            expected_model = str(alias_spec)
+        else:
+            expected_model = model_target
+        expected_reasoning = (
+            "none"
+            if reasoning in {"provider", "provider-managed", "provider_managed", "auto"}
+            else reasoning
+        )
+
+        model_snapshot = self._snapshot_session_model_override(session_key)
+        state = self._peek_session_state(session_key)
+        reasoning_snapshot = (
+            None
+            if state is None or state.conversation.reasoning_override is None
+            else dict(state.conversation.reasoning_override)
+        )
+        service_tier_snapshot = self._resolve_session_service_tier(
+            session_key=session_key
+        )
+
+        async def restore() -> None:
+            self._restore_session_model_override(session_key, model_snapshot)
+            self._set_session_reasoning_override(session_key, reasoning_snapshot)
+            self._set_session_service_tier_override(
+                session_key, service_tier_snapshot
+            )
+            persisted = (
+                model_snapshot.get("override")
+                if model_snapshot.get("had_override")
+                else None
+            )
+            try:
+                await self.async_session_store.set_model_override(
+                    session_key, persisted
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to persist model rollback for /mode %s",
+                    mode_name,
+                    exc_info=True,
+                )
+            self._evict_cached_agent(session_key)
+
+        def failed(text: Any) -> bool:
+            lowered = str(text or "").strip().lower()
+            return lowered.startswith("❌") or "failed" in lowered
+
+        def child_event(text: str) -> MessageEvent:
+            raw = dict(event.raw_message) if isinstance(event.raw_message, dict) else {}
+            raw["_hermes_mode_preset"] = mode_name
+            return MessageEvent(
+                text=text,
+                message_type=MessageType.COMMAND,
+                source=source,
+                raw_message=raw,
+                message_id=event.message_id,
+            )
+
+        try:
+            model_result = await self._handle_model_command(
+                child_event(f"/model {shlex.quote(model_target)} --session")
+            )
+            if failed(model_result):
+                await restore()
+                return f"❌ Mode `{mode_name}` failed while switching model: {model_result}"
+
+            reasoning_result = await self._handle_reasoning_command(
+                child_event(f"/reasoning {shlex.quote(reasoning)}")
+            )
+            if failed(reasoning_result):
+                await restore()
+                return f"❌ Mode `{mode_name}` failed while setting reasoning: {reasoning_result}"
+
+            fast_result = await self._handle_fast_command(
+                child_event(f"/fast {'fast' if fast else 'normal'}")
+            )
+            if failed(fast_result):
+                await restore()
+                return f"❌ Mode `{mode_name}` failed while setting Fast mode: {fast_result}"
+
+            actual_override = dict(
+                ((getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {})
+            )
+            actual_model = str(actual_override.get("model") or "")
+            actual_reasoning = self._resolve_session_reasoning_config(
+                source=source,
+                session_key=session_key,
+                model=actual_model,
+            )
+            actual_reasoning_value = (
+                "none"
+                if not actual_reasoning or actual_reasoning.get("enabled") is False
+                else str(actual_reasoning.get("effort") or "medium")
+            )
+            actual_fast = self._resolve_session_service_tier(
+                session_key=session_key
+            ) == "priority"
+            if (
+                actual_model != expected_model
+                or actual_reasoning_value != expected_reasoning
+                or actual_fast != fast
+            ):
+                await restore()
+                return (
+                    f"❌ Mode `{mode_name}` verification failed; previous settings restored."
+                )
+        except Exception:
+            await restore()
+            raise
+
+        return (
+            f"✅ Mode `{mode_name}` applied: `{expected_model}` · Reasoning "
+            f"`{expected_reasoning}` · Fast `{'on' if fast else 'off'}`"
+        )
+
     async def _handle_reasoning_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /reasoning command — manage reasoning effort and display toggle.
 
@@ -4138,7 +4310,10 @@ class GatewaySlashCommandsMixin:
         )
 
         user_config = _load_gateway_config()
-        model = _resolve_gateway_model(user_config)
+        model = str(
+            ((getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {}).get("model")
+            or _resolve_gateway_model(user_config)
+        )
         if not model_supports_fast_mode(model):
             return t("gateway.fast.not_supported")
 
