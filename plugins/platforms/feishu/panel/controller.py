@@ -62,8 +62,8 @@ class FeishuPanelController:
         self.adapter = adapter
         self.store = store
         self._view_tasks: set[asyncio.Task[Any]] = set()
-        self._model_catalog_cache: dict[
-            tuple[str, str, str, str, str], tuple[float, dict[str, Any]]
+        self._model_inventory_cache: dict[
+            str, tuple[float, list[dict[str, Any]]]
         ] = {}
         self._closed = False
         # Expired rows otherwise accumulate forever because PanelStateStore is
@@ -277,17 +277,12 @@ class FeishuPanelController:
         include_catalog, include_sessions, include_status = self._view_snapshot_flags(view)
         error = ""
         payload: dict[str, Any] | None = None
-        cache_key = (
-            state.profile or "default",
-            str(state.data.get("effective_provider") or ""),
-            str(state.data.get("effective_model") or ""),
-            str(state.data.get("global_provider") or ""),
-            str(state.data.get("global_model") or ""),
-        )
+        cache_key = state.profile or "default"
+        cached_inventory: list[dict[str, Any]] | None = None
         if view == "model" and not force_reload:
-            cached = self._model_catalog_cache.get(cache_key)
+            cached = self._model_inventory_cache.get(cache_key)
             if cached and time.monotonic() - cached[0] < _MODEL_CATALOG_CACHE_TTL_SECONDS:
-                payload = copy.deepcopy(cached[1])
+                cached_inventory = copy.deepcopy(cached[1])
         try:
             source = self._source(state)
             if payload is None:
@@ -299,22 +294,18 @@ class FeishuPanelController:
                         include_catalog=include_catalog,
                         include_sessions=include_sessions,
                         include_status=include_status,
+                        catalog_provider_rows=cached_inventory,
                     ),
                     timeout=_VIEW_LOAD_TIMEOUT_SECONDS,
                 )
-                payload = self._view_payload(view, snapshot)
                 if view == "model":
-                    self._model_catalog_cache[cache_key] = (
-                        time.monotonic(),
-                        copy.deepcopy(payload),
-                    )
-            if view == "model":
-                effective_provider = str(state.data.get("effective_provider") or "")
-                for provider in payload.get("model_providers") or []:
-                    if isinstance(provider, dict):
-                        provider["is_current"] = (
-                            str(provider.get("slug") or "") == effective_provider
+                    inventory = snapshot.get("_model_provider_inventory")
+                    if cached_inventory is None and isinstance(inventory, list):
+                        self._model_inventory_cache[cache_key] = (
+                            time.monotonic(),
+                            copy.deepcopy(inventory),
                         )
+                payload = self._view_payload(view, snapshot)
         except asyncio.TimeoutError:
             payload = {}
             error = f"加载超时（>{_VIEW_LOAD_TIMEOUT_SECONDS:g}s），请重试"
