@@ -242,6 +242,7 @@ class HermesPanelControlService:
         include_catalog: bool = True,
         include_sessions: bool = True,
         include_status: bool = True,
+        catalog_provider_rows: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Return only JSON-serializable, server-trusted panel data.
 
@@ -311,49 +312,64 @@ class HermesPanelControlService:
             )
             model_providers: list[dict[str, Any]] = []
             model_options: list[dict[str, str]] = []
+            provider_rows: list[dict[str, Any]] = []
             if include_catalog:
-                provider_rows = []
-                try:
-                    from hermes_cli.config import get_compatible_custom_providers
-                    from hermes_cli.model_switch import list_authenticated_providers
-
+                if catalog_provider_rows is not None:
+                    # The cache stores provider inventory only. Session-relative
+                    # flags are deliberately stripped before rebuilding this
+                    # request's effective/global routes below.
+                    provider_rows = [
+                        {**dict(row), "is_current": False}
+                        for row in catalog_provider_rows
+                        if isinstance(row, dict)
+                    ]
+                else:
                     try:
-                        custom_providers = get_compatible_custom_providers(cfg)
-                    except Exception:
-                        custom_providers = cfg.get("custom_providers")
-                    model_catalog = cfg.get("model_catalog")
-                    configured_exclusions = {
-                        str(item).strip()
-                        for item in (
-                            (model_catalog.get("excluded_providers") or [])
-                            if isinstance(model_catalog, dict)
-                            else []
+                        from hermes_cli.config import get_compatible_custom_providers
+                        from hermes_cli.model_switch import list_authenticated_providers
+
+                        try:
+                            custom_providers = get_compatible_custom_providers(cfg)
+                        except Exception:
+                            custom_providers = cfg.get("custom_providers")
+                        model_catalog = cfg.get("model_catalog")
+                        configured_exclusions = {
+                            str(item).strip()
+                            for item in (
+                                (model_catalog.get("excluded_providers") or [])
+                                if isinstance(model_catalog, dict)
+                                else []
+                            )
+                            if str(item).strip()
+                        }
+                        excluded_providers = sorted(
+                            configured_exclusions | HIDDEN_PANEL_PROVIDER_SLUGS
                         )
-                        if str(item).strip()
-                    }
-                    excluded_providers = sorted(
-                        configured_exclusions | HIDDEN_PANEL_PROVIDER_SLUGS
-                    )
-                    raw_user_providers = cfg.get("providers")
-                    user_providers = (
-                        dict(raw_user_providers)
-                        if isinstance(raw_user_providers, dict)
-                        else {}
-                    )
-                    provider_rows = await asyncio.to_thread(
-                        list_authenticated_providers,
-                        current_provider=effective_provider,
-                        current_base_url=effective_base_url,
-                        current_model=effective_model,
-                        user_providers=user_providers,
-                        custom_providers=custom_providers,
-                        max_models=50,
-                        probe_custom_providers=False,
-                        for_picker=True,
-                        excluded_providers=excluded_providers,
-                    )
-                except Exception:
-                    provider_rows = []
+                        raw_user_providers = cfg.get("providers")
+                        user_providers = (
+                            dict(raw_user_providers)
+                            if isinstance(raw_user_providers, dict)
+                            else {}
+                        )
+                        discovered = await asyncio.to_thread(
+                            list_authenticated_providers,
+                            current_provider=effective_provider,
+                            current_base_url=effective_base_url,
+                            current_model=effective_model,
+                            user_providers=user_providers,
+                            custom_providers=custom_providers,
+                            max_models=50,
+                            probe_custom_providers=False,
+                            for_picker=True,
+                            excluded_providers=excluded_providers,
+                        )
+                        provider_rows = [
+                            {**dict(row), "is_current": False}
+                            for row in (discovered or [])
+                            if isinstance(row, dict)
+                        ]
+                    except Exception:
+                        provider_rows = []
                 model_providers, model_options = self._build_model_catalog(
                     provider_rows=list(provider_rows or []),
                     aliases=aliases,
@@ -411,9 +427,17 @@ class HermesPanelControlService:
                         limit=50,
                         exclude_sources=["tool"],
                     )
-                    for row in rows:
-                        if await self.runner._resume_row_visible(source, row, allow_all=False):
-                            session_rows.append(dict(row))
+                    caller_source = source.platform.value if source.platform else ""
+                    # query_session_listing already applies both predicates at
+                    # SQL level. Recheck them in memory so a malformed/test DB
+                    # row still fails closed, without issuing one get_session
+                    # query per row through _resume_row_visible().
+                    session_rows = [
+                        dict(row)
+                        for row in rows
+                        if str(row.get("session_key") or "") == session_key
+                        and str(row.get("source") or "") == caller_source
+                    ]
                 except Exception:
                     session_rows = []
 
@@ -458,6 +482,9 @@ class HermesPanelControlService:
             if include_catalog:
                 result["model_providers"] = model_providers
                 result["model_options"] = model_options
+                # Controller-only cache material; _view_payload never persists
+                # this key into PanelState or sends it to Feishu.
+                result["_model_provider_inventory"] = provider_rows
             if include_sessions:
                 result["sessions"] = session_rows
             if include_status:
@@ -547,12 +574,23 @@ class HermesPanelControlService:
                         pass
                     self.runner._evict_cached_agent(session_key)
 
-                result = str(
-                    await self.runner._handle_mode_command(
-                        self._event(source, f"/mode {shlex.quote(name)}", trusted_model_selection=True)
+                try:
+                    result = str(
+                        await self.runner._handle_mode_command(
+                            self._event(
+                                source,
+                                f"/mode {shlex.quote(name)}",
+                                trusted_model_selection=True,
+                            )
+                        )
+                        or ""
                     )
-                    or ""
-                )
+                except Exception:
+                    # /mode can mutate one or more in-memory overrides before a
+                    # provider/persistence failure escapes. Preserve the atomic
+                    # Panel preset contract before the controller reports it.
+                    await restore_preset_snapshot()
+                    raise
                 if self._failed(result):
                     await restore_preset_snapshot()
                     return PanelControlResult(False, f"预设应用失败，已回滚：{result}")
