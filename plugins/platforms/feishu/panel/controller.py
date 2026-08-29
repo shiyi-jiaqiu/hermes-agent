@@ -63,8 +63,12 @@ class FeishuPanelController:
         self.store = store
         self._view_tasks: set[asyncio.Task[Any]] = set()
         self._model_catalog_cache: dict[
-            str, tuple[float, dict[str, Any]]
+            tuple[str, str, str, str, str], tuple[float, dict[str, Any]]
         ] = {}
+        self._closed = False
+        # Expired rows otherwise accumulate forever because PanelStateStore is
+        # process-long-lived. Startup is a cheap, deterministic cleanup point.
+        self.store.prune()
 
     def _service(self) -> HermesPanelControlService:
         runner = getattr(self.adapter, "gateway_runner", None)
@@ -157,6 +161,8 @@ class FeishuPanelController:
 
     def schedule_view_load(self, panel_id: str, view: str) -> bool:
         """Load one page after its initial card has been sent."""
+        if self._closed:
+            return False
         try:
             task = asyncio.create_task(self._load_view(panel_id=panel_id, view=view))
         except RuntimeError:
@@ -174,6 +180,20 @@ class FeishuPanelController:
 
         task.add_done_callback(_complete)
         return True
+
+    async def close(self) -> None:
+        """Cancel owned loaders and close the process-lifetime state store."""
+        if self._closed:
+            return
+        self._closed = True
+        tasks = list(self._view_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._view_tasks.clear()
+        self.store.prune()
+        self.store.close()
 
     @staticmethod
     def _view_snapshot_flags(view: str) -> tuple[bool, bool, bool]:
@@ -212,6 +232,17 @@ class FeishuPanelController:
                 callback_token=callback_token,
                 card=card,
             )
+            if not update.success:
+                logger.warning(
+                    "[Feishu Panel] callback-token update failed panel=%s; "
+                    "falling back to message update: %s",
+                    state.panel_id,
+                    update.error,
+                )
+                update = await self.adapter.update_interactive_message(
+                    message_id=state.message_id,
+                    card=card,
+                )
         else:
             # This path is only used for an initial /panel <view> card, before
             # any interaction callback exists.
@@ -243,16 +274,22 @@ class FeishuPanelController:
         state = self.store.get(panel_id)
         if state is None or not self.store.is_active(state):
             return
-        source = self._source(state)
         include_catalog, include_sessions, include_status = self._view_snapshot_flags(view)
         error = ""
         payload: dict[str, Any] | None = None
-        cache_key = state.profile or "default"
+        cache_key = (
+            state.profile or "default",
+            str(state.data.get("effective_provider") or ""),
+            str(state.data.get("effective_model") or ""),
+            str(state.data.get("global_provider") or ""),
+            str(state.data.get("global_model") or ""),
+        )
         if view == "model" and not force_reload:
             cached = self._model_catalog_cache.get(cache_key)
             if cached and time.monotonic() - cached[0] < _MODEL_CATALOG_CACHE_TTL_SECONDS:
                 payload = copy.deepcopy(cached[1])
         try:
+            source = self._source(state)
             if payload is None:
                 snapshot = await asyncio.wait_for(
                     self._service().snapshot(
@@ -322,6 +359,32 @@ class FeishuPanelController:
                 callback_token=callback_token,
                 callback_started_at=callback_started_at,
             )
+
+    def _fail_view_load_schedule(
+        self,
+        panel_id: str,
+        view: str,
+        message: str,
+    ) -> PanelState | None:
+        """Turn an unscheduled loading state into a retryable error state."""
+        for _attempt in range(3):
+            latest = self.store.get(panel_id)
+            if latest is None or not self.store.is_active(latest):
+                return latest
+            expected = latest.revision
+            loading = set(latest.data.get("loading_views") or [])
+            loaded = set(latest.data.get("loaded_views") or [])
+            errors = dict(latest.data.get("load_errors") or {})
+            loading.discard(view)
+            loaded.discard(view)
+            errors[view] = message
+            latest.data["loading_views"] = sorted(loading)
+            latest.data["loaded_views"] = sorted(loaded)
+            latest.data["load_errors"] = errors
+            latest.revision += 1
+            if self.store.compare_and_set(expected, latest):
+                return latest
+        return self.store.get(panel_id)
 
     def attach_message_id(self, state: PanelState, message_id: str) -> bool:
         current = self.store.get(state.panel_id)
@@ -487,8 +550,13 @@ class FeishuPanelController:
                     ),
                 )
                 if not scheduled:
+                    failed = self._fail_view_load_schedule(
+                        state.panel_id,
+                        load_view,
+                        "页面加载任务无法调度，请重试",
+                    ) or new_state
                     return PanelCallbackResult(
-                        card=render_panel(new_state),
+                        card=render_panel(failed),
                         toast="页面加载任务无法调度，请重试",
                         toast_type="error",
                     )
@@ -563,7 +631,16 @@ class FeishuPanelController:
                 ),
             )
             if not scheduled:
-                return PanelCallbackResult(card=render_panel(refreshing), toast="刷新任务无法调度", toast_type="error")
+                failed = self._fail_view_load_schedule(
+                    state.panel_id,
+                    refresh_view,
+                    "刷新任务无法调度，请重试",
+                ) or refreshing
+                return PanelCallbackResult(
+                    card=render_panel(failed),
+                    toast="刷新任务无法调度",
+                    toast_type="error",
+                )
             return PanelCallbackResult(card=render_panel(refreshing), toast="正在刷新…")
 
         if action.op != "exec":
@@ -682,18 +759,8 @@ class FeishuPanelController:
         if not self.store.compare_and_set(expected, latest):
             return
         if latest.message_id:
-            card = render_panel(latest)
-            elapsed = time.monotonic() - callback_started_at
-            if elapsed < _CALLBACK_SETTLE_SECONDS:
-                await asyncio.sleep(_CALLBACK_SETTLE_SECONDS - elapsed)
-            update = await self.adapter.update_interactive_card_after_callback(
+            await self._update_loaded_card(
+                latest,
                 callback_token=callback_token,
-                card=card,
+                callback_started_at=callback_started_at,
             )
-            if not update.success:
-                logger.warning(
-                    "[Feishu Panel] delayed update failed panel=%s message=%s: %s",
-                    latest.panel_id,
-                    latest.message_id,
-                    update.error,
-                )
