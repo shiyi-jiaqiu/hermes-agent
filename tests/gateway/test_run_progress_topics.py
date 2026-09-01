@@ -283,6 +283,30 @@ class FailingNativeTaskCardAdapter(NativeTaskCardAdapter):
         return SendResult(success=False, error="native stream unavailable", retryable=True)
 
 
+class NativeFeishuProgressAdapter(ProgressCaptureAdapter):
+    def __init__(self, platform=Platform.FEISHU):
+        super().__init__(platform=platform)
+        self.progress_cards = []
+        self.progress_card_updates = []
+
+    async def send_coding_progress_card(
+        self, chat_id, card, *, reply_to=None, metadata=None
+    ) -> SendResult:
+        self.progress_cards.append(
+            {
+                "chat_id": chat_id,
+                "card": card,
+                "reply_to": reply_to,
+                "metadata": dict(metadata or {}),
+            }
+        )
+        return SendResult(success=True, message_id="feishu-progress-1")
+
+    async def update_coding_progress_card(self, message_id, card) -> SendResult:
+        self.progress_card_updates.append({"message_id": message_id, "card": card})
+        return SendResult(success=True, message_id=message_id)
+
+
 class DuplicateNativeToolsAgent:
     def __init__(self, **kwargs):
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
@@ -1101,6 +1125,47 @@ async def test_slack_native_progress_correlates_concurrent_duplicate_tools_by_id
     ]
     assert adapter.sent == []
     assert adapter.native_stops == 1
+
+
+@pytest.mark.asyncio
+async def test_feishu_native_progress_card_is_id_correlated_and_finalized(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        DuplicateNativeToolsAgent,
+        session_id="sess-feishu-native-ids",
+        config_data={
+            "display": {
+                "platforms": {
+                    "feishu": {
+                        "tool_progress": "all",
+                        "tool_progress_style": "card",
+                        "tool_edit_display": "diff",
+                    }
+                }
+            }
+        },
+        platform=Platform.FEISHU,
+        chat_id="oc_feishu",
+        chat_type="dm",
+        thread_id="",
+        adapter_cls=NativeFeishuProgressAdapter,
+        user_id="ou_user",
+    )
+
+    assert result["final_response"] == "done"
+    assert isinstance(adapter, NativeFeishuProgressAdapter)
+    assert adapter.progress_cards
+    assert adapter.progress_card_updates
+    assert adapter.sent == []
+    final_card = adapter.progress_card_updates[-1]["card"]
+    assert final_card["header"]["template"] == "red"
+    content = final_card["elements"][0]["content"]
+    assert "alpha" in content
+    assert "beta" in content
+    assert "✗" in content
 
 
 @pytest.mark.asyncio

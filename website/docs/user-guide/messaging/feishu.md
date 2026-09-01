@@ -275,6 +275,45 @@ Peer bots do not need to be added to `FEISHU_ALLOWED_USERS` — that allowlist a
 
 Grant the `application:bot.basic_info:read` scope to display peer bot names; without it, peer bots still route correctly but appear as their `open_id`.
 
+## Coding Progress Cards
+
+Feishu can present tool execution as one editable interactive card with full
+(redacted) terminal commands, ID-correlated completion state, duration/exit
+code, and bounded file-edit diffs. This is opt-in:
+
+```yaml
+# ~/.hermes/config.yaml
+display:
+  tool_progress_command: true
+  interim_assistant_messages: true
+  show_commentary: true
+  platforms:
+    feishu:
+      tool_progress: all
+      tool_preview_length: 1000
+      tool_progress_grouping: accumulate
+      tool_progress_style: card       # text | card
+      tool_edit_display: diff         # off | summary | diff
+      tool_diff_visibility: private   # private | all
+      tool_diff_max_files: 6
+      tool_diff_max_lines: 80
+      tool_diff_max_chars: 6000
+      tool_progress_max_items: 8
+      tool_progress_card_max_chars: 7200
+```
+
+`patch` uses the unified diff already returned by the tool. For local
+`write_file` operations Hermes captures the pre-write state and derives the
+diff after completion. Diff text is force-redacted and bounded before it leaves
+the gateway. With `tool_diff_visibility: private` (the recommended default),
+group chats show file/addition/deletion summaries but not source lines.
+
+The card transport is presentation-only: it does not alter tool results,
+conversation history, prompts, or prompt caching. A permanent card transport
+failure falls back to the existing editable Feishu post progress. These cards
+have no buttons, so they require no app permission or event subscription beyond
+normal message sending.
+
 ## Interactive Card Actions
 
 When users click buttons or interact with interactive cards sent by the bot, the adapter routes these as synthetic `/card` command events:

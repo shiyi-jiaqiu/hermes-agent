@@ -4811,7 +4811,9 @@ class TurnRunner:
         # tool_start/tool_complete callbacks instead. Do not also enqueue
         # name-correlated text events, which would duplicate cards and
         # mispair concurrent calls to the same tool.
-        if ctx._native_slack_task_cards and event_type in {
+        if (
+            ctx._native_slack_task_cards or ctx._native_feishu_progress_card
+        ) and event_type in {
             "tool.started",
             "tool.completed",
         }:
@@ -5204,6 +5206,203 @@ class TurnRunner:
                         exc_info=True,
                     )
 
+    async def _send_native_feishu_progress(self, adapter) -> None:
+        """Drain ID-bearing tool events into one editable Feishu progress card."""
+        ctx = self._ctx
+        from plugins.platforms.feishu.progress import (
+            render_progress_card,
+            render_progress_fallback,
+        )
+
+        items: Dict[str, Dict[str, Any]] = {}
+        order: List[str] = []
+        message_id: Optional[str] = None
+        fallback_message_id: Optional[str] = None
+        native_failed = False
+        dirty = False
+        last_delivery = 0.0
+        last_attempt = 0.0
+        _EDIT_INTERVAL = 1.0
+
+        def _visible_items() -> List[Dict[str, Any]]:
+            return [items[call_id] for call_id in order]
+
+        def _apply_event(raw: Any) -> bool:
+            if not isinstance(raw, dict):
+                return False
+            event_type = raw.get("type")
+            if event_type not in {"tool.started", "tool.completed"}:
+                return False
+            call_id = str(raw.get("tool_call_id") or "")
+            if not call_id:
+                call_id = f"anonymous_{len(order) + 1}"
+            if event_type == "tool.started":
+                if call_id not in items:
+                    order.append(call_id)
+                items[call_id] = {
+                    "call_id": call_id,
+                    "tool_name": str(raw.get("tool_name") or "tool"),
+                    "args": raw.get("args") if isinstance(raw.get("args"), dict) else {},
+                    "preview": str(raw.get("preview") or ""),
+                    "status": "running",
+                }
+                return True
+
+            item = items.get(call_id)
+            if item is None:
+                order.append(call_id)
+                item = {
+                    "call_id": call_id,
+                    "tool_name": str(raw.get("tool_name") or "tool"),
+                    "args": raw.get("args") if isinstance(raw.get("args"), dict) else {},
+                    "preview": "",
+                    "status": "running",
+                }
+                items[call_id] = item
+            item.update(
+                {
+                    "status": "error" if raw.get("is_error") else "success",
+                    "duration": raw.get("duration"),
+                    "exit_code": raw.get("exit_code"),
+                    "diff": raw.get("diff"),
+                    "error": raw.get("error"),
+                }
+            )
+            return True
+
+        async def _deliver(*, finalized: bool = False, force: bool = False) -> bool:
+            nonlocal message_id, fallback_message_id, native_failed, last_delivery, last_attempt, dirty
+            if not items:
+                return True
+            now = time.monotonic()
+            if not force and now - last_attempt < _EDIT_INTERVAL:
+                return False
+            last_attempt = now
+            visible = _visible_items()
+            if not native_failed:
+                card = render_progress_card(
+                    visible,
+                    finalized=finalized,
+                    edit_display=ctx._tool_edit_display,
+                    max_items=ctx._tool_progress_max_items,
+                    max_chars=ctx._tool_progress_card_max_chars,
+                )
+                if message_id:
+                    result = await adapter.update_coding_progress_card(message_id, card)
+                else:
+                    result = await adapter.send_coding_progress_card(
+                        ctx.source.chat_id,
+                        card,
+                        reply_to=ctx._progress_reply_to,
+                        metadata=ctx._progress_metadata,
+                    )
+                if getattr(result, "success", False):
+                    message_id = str(getattr(result, "message_id", None) or message_id or "")
+                    if ctx._cleanup_progress and message_id and message_id not in ctx._cleanup_msg_ids:
+                        ctx._cleanup_msg_ids.append(message_id)
+                    dirty = False
+                    last_delivery = now
+                    return True
+                if getattr(result, "retryable", False):
+                    return False
+                native_failed = True
+                logger.warning(
+                    "[Feishu] Native coding progress unavailable; falling back to post: %s",
+                    getattr(result, "error", "unknown error"),
+                )
+
+            text = render_progress_fallback(
+                visible,
+                edit_display=(
+                    "summary" if ctx._tool_edit_display == "diff" else ctx._tool_edit_display
+                ),
+                max_items=ctx._tool_progress_max_items,
+                max_chars=ctx._tool_progress_card_max_chars,
+            )
+            if fallback_message_id:
+                result = await adapter.edit_message(
+                    ctx.source.chat_id,
+                    fallback_message_id,
+                    text,
+                )
+            else:
+                result = await adapter.send(
+                    chat_id=ctx.source.chat_id,
+                    content=text,
+                    reply_to=ctx._progress_reply_to,
+                    metadata=ctx._progress_metadata,
+                )
+            if getattr(result, "success", False):
+                fallback_message_id = str(
+                    getattr(result, "message_id", None) or fallback_message_id or ""
+                )
+                if (
+                    ctx._cleanup_progress
+                    and fallback_message_id
+                    and fallback_message_id not in ctx._cleanup_msg_ids
+                ):
+                    ctx._cleanup_msg_ids.append(fallback_message_id)
+                dirty = False
+                last_delivery = now
+                return True
+            return False
+
+        async def _reset_segment() -> None:
+            nonlocal message_id, fallback_message_id, native_failed, dirty
+            await _deliver(finalized=True, force=True)
+            items.clear()
+            order.clear()
+            message_id = None
+            fallback_message_id = None
+            native_failed = False
+            dirty = False
+
+        try:
+            while True:
+                if not ctx._run_still_current():
+                    return
+                processed = False
+                while True:
+                    try:
+                        raw = ctx.progress_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    processed = True
+                    if isinstance(raw, tuple) and raw and raw[0] == "__reset__":
+                        await _reset_segment()
+                        continue
+                    if isinstance(raw, str):
+                        await adapter.send(
+                            chat_id=ctx.source.chat_id,
+                            content=raw,
+                            reply_to=ctx._progress_reply_to,
+                            metadata=ctx._progress_metadata,
+                        )
+                        continue
+                    if _apply_event(raw):
+                        dirty = True
+                if dirty:
+                    await _deliver()
+                await asyncio.sleep(0.1 if processed else 0.2)
+        except asyncio.CancelledError:
+            while True:
+                try:
+                    raw = ctx.progress_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(raw, tuple) and raw and raw[0] == "__reset__":
+                    await _reset_segment()
+                elif _apply_event(raw):
+                    dirty = True
+            if items:
+                try:
+                    await _deliver(finalized=True, force=True)
+                except Exception:
+                    logger.debug("Final Feishu coding progress update failed", exc_info=True)
+            return
+        except Exception:
+            logger.error("Feishu coding progress sender failed", exc_info=True)
+
     async def send_progress_messages(self):
         ctx = self._ctx
         if not ctx.progress_queue:
@@ -5211,6 +5410,14 @@ class TurnRunner:
 
         adapter = self._runner._adapter_for_source(ctx.source)
         if not adapter:
+            return
+
+        if (
+            ctx._native_feishu_progress_card
+            and hasattr(adapter, "send_coding_progress_card")
+            and hasattr(adapter, "update_coding_progress_card")
+        ):
+            await self._send_native_feishu_progress(adapter)
             return
 
         if ctx._native_slack_task_cards and hasattr(
@@ -5605,13 +5812,27 @@ class TurnRunner:
             pass
         from agent.display import build_tool_preview
 
+        call_key = str(call_id or "")
+        safe_args = args if isinstance(args, dict) else {}
+        ctx._native_tool_started_at[call_key] = time.monotonic()
+        if ctx._native_feishu_progress_card and ctx._tool_edit_display != "off":
+            try:
+                from agent.display import capture_local_edit_snapshot
+
+                snapshot = capture_local_edit_snapshot(str(tool_name or "tool"), safe_args)
+                if snapshot is not None:
+                    ctx._native_edit_snapshots[call_key] = snapshot
+            except Exception:
+                logger.debug("Gateway edit snapshot capture failed", exc_info=True)
+
         ctx.progress_queue.put(
             {
                 "type": "tool.started",
-                "tool_call_id": str(call_id or ""),
+                "tool_call_id": call_key,
                 "tool_name": str(tool_name or "tool"),
+                "args": safe_args,
                 "preview": build_tool_preview(
-                    str(tool_name or "tool"), args or {}, max_len=64
+                    str(tool_name or "tool"), safe_args, max_len=1000
                 )
                 or "",
             }
@@ -5630,13 +5851,67 @@ class TurnRunner:
             pass
         from agent.display import _detect_tool_failure
 
-        is_error, _ = _detect_tool_failure(str(tool_name or "tool"), result)
+        call_key = str(call_id or "")
+        tool_key = str(tool_name or "tool")
+        safe_args = args if isinstance(args, dict) else {}
+        started_at = ctx._native_tool_started_at.pop(call_key, None)
+        duration = (
+            max(0.0, time.monotonic() - started_at)
+            if isinstance(started_at, (int, float))
+            else None
+        )
+        is_error, error_text = _detect_tool_failure(tool_key, result)
+
+        exit_code = None
+        if tool_key == "terminal" and isinstance(result, str):
+            try:
+                parsed_result = json.loads(result)
+                if isinstance(parsed_result, dict) and isinstance(parsed_result.get("exit_code"), int):
+                    exit_code = parsed_result["exit_code"]
+            except (TypeError, ValueError):
+                pass
+
+        diff_summary = None
+        snapshot = ctx._native_edit_snapshots.pop(call_key, None)
+        if (
+            ctx._native_feishu_progress_card
+            and ctx._tool_edit_display != "off"
+            and not is_error
+        ):
+            chat_type = str(getattr(ctx.source, "chat_type", "") or "").lower()
+            private_chat = chat_type in {"dm", "p2p", "private", "direct"}
+            include_diff_body = (
+                ctx._tool_diff_visibility == "all" or private_chat
+            )
+            try:
+                from gateway.tool_progress_diff import build_edit_diff_summary
+
+                diff_summary = build_edit_diff_summary(
+                    tool_key,
+                    result if isinstance(result, str) else str(result or ""),
+                    function_args=safe_args,
+                    snapshot=snapshot,
+                    max_files=ctx._tool_diff_max_files,
+                    max_lines=(ctx._tool_diff_max_lines if include_diff_body else 0),
+                    max_chars=(ctx._tool_diff_max_chars if include_diff_body else 0),
+                )
+            except Exception:
+                logger.debug("Gateway edit diff extraction failed", exc_info=True)
+
+        safe_error = ""
+        if is_error and error_text:
+            safe_error = _redact_gateway_user_facing_secrets(str(error_text))[:300]
         ctx.progress_queue.put(
             {
                 "type": "tool.completed",
-                "tool_call_id": str(call_id or ""),
-                "tool_name": str(tool_name or "tool"),
+                "tool_call_id": call_key,
+                "tool_name": tool_key,
+                "args": safe_args,
                 "is_error": bool(is_error),
+                "duration": duration,
+                "exit_code": exit_code,
+                "diff": diff_summary,
+                "error": safe_error,
             }
         )
 
@@ -5645,7 +5920,7 @@ class TurnRunner:
         ctx = self._ctx
         if ctx._voice_ack_guild[0] is not None:
             self.voice_ack_callback(call_id, tool_name, args)
-        if ctx._native_slack_task_cards:
+        if ctx._native_slack_task_cards or ctx._native_feishu_progress_card:
             self.native_tool_start_callback(call_id, tool_name, args)
 
     def _step_callback_sync(self, iteration: int, prev_tools: list) -> None:
@@ -6258,12 +6533,15 @@ class TurnRunner:
             if (
                 ctx._voice_ack_guild[0] is not None
                 or ctx._native_slack_task_cards
+                or ctx._native_feishu_progress_card
             )
             else None
         )
         agent.tool_complete_callback = (
             ctx.native_tool_complete_callback
-            if ctx._native_slack_task_cards
+            if (
+                ctx._native_slack_task_cards or ctx._native_feishu_progress_card
+            )
             and ctx.native_tool_complete_callback is not None
             else None
         )
@@ -30372,8 +30650,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception:
                 logger.debug("Slack native task-card config check failed", exc_info=True)
+        _native_feishu_progress_card = False
+        _tool_progress_style = resolve_display_setting(
+            user_config, platform_key, "tool_progress_style", "text"
+        )
+        _tool_edit_display = resolve_display_setting(
+            user_config, platform_key, "tool_edit_display", "off"
+        )
+        _tool_diff_visibility = resolve_display_setting(
+            user_config, platform_key, "tool_diff_visibility", "private"
+        )
+        _tool_diff_max_files = int(resolve_display_setting(
+            user_config, platform_key, "tool_diff_max_files", 6
+        ) or 6)
+        _tool_diff_max_lines = int(resolve_display_setting(
+            user_config, platform_key, "tool_diff_max_lines", 80
+        ) or 0)
+        _tool_diff_max_chars = int(resolve_display_setting(
+            user_config, platform_key, "tool_diff_max_chars", 6000
+        ) or 0)
+        _tool_progress_max_items = int(resolve_display_setting(
+            user_config, platform_key, "tool_progress_max_items", 8
+        ) or 8)
+        _tool_progress_card_max_chars = int(resolve_display_setting(
+            user_config, platform_key, "tool_progress_card_max_chars", 7200
+        ) or 7200)
+        if (
+            source.platform == Platform.FEISHU
+            and tool_progress_enabled
+            and _tool_progress_style == "card"
+            and _progress_adapter_for_native is not None
+            and hasattr(_progress_adapter_for_native, "send_coding_progress_card")
+            and hasattr(_progress_adapter_for_native, "update_coding_progress_card")
+        ):
+            _native_feishu_progress_card = True
+
         needs_progress_queue = (
-            tool_progress_enabled or _thinking_enabled or _native_slack_task_cards
+            tool_progress_enabled
+            or _thinking_enabled
+            or _native_slack_task_cards
+            or _native_feishu_progress_card
         )
 
 
@@ -30467,6 +30783,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             interim_assistant_messages_enabled=interim_assistant_messages_enabled,
             needs_progress_queue=needs_progress_queue,
             _native_slack_task_cards=_native_slack_task_cards,
+            _native_feishu_progress_card=_native_feishu_progress_card,
+            _tool_edit_display=_tool_edit_display,
+            _tool_diff_visibility=_tool_diff_visibility,
+            _tool_diff_max_files=_tool_diff_max_files,
+            _tool_diff_max_lines=_tool_diff_max_lines,
+            _tool_diff_max_chars=_tool_diff_max_chars,
+            _tool_progress_max_items=_tool_progress_max_items,
+            _tool_progress_card_max_chars=_tool_progress_card_max_chars,
             _voice_ack_fired=_voice_ack_fired,
             _voice_ack_guild=_voice_ack_guild,
             _voice_ack_loop=_voice_ack_loop,

@@ -140,11 +140,19 @@ class TurnContext:
     _event_callback_sync: Optional[Callable] = None
     _status_callback_sync: Optional[Callable] = None
 
-    # --- Slack-native task-card progress (opt-in; #29483) ------------------
-    # True when the Slack adapter's ``native_task_cards_enabled()`` opt-in is
-    # set for this turn's platform. The ID-bearing lifecycle callbacks are
-    # published by TurnRunner (like voice_ack_callback above) so tool starts
-    # and completions correlate by real tool-call ID instead of tool name.
+    # --- Native structured tool progress ----------------------------------
+    # Slack uses plan/task cards; Feishu uses an editable coding-progress card.
+    # Both consume the authoritative ID-bearing lifecycle callbacks.
     _native_slack_task_cards: bool = False
+    _native_feishu_progress_card: bool = False
+    _tool_edit_display: str = "off"
+    _tool_diff_visibility: str = "private"
+    _tool_diff_max_files: int = 6
+    _tool_diff_max_lines: int = 80
+    _tool_diff_max_chars: int = 6000
+    _tool_progress_max_items: int = 8
+    _tool_progress_card_max_chars: int = 7200
+    _native_tool_started_at: dict = field(default_factory=dict)
+    _native_edit_snapshots: dict = field(default_factory=dict)
     native_tool_start_callback: Optional[Callable] = None
     native_tool_complete_callback: Optional[Callable] = None

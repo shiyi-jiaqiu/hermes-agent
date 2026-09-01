@@ -1594,6 +1594,17 @@ DEFAULT_CONFIG = {
         # applies where tool_progress is already enabled. Per-platform override
         # via display.platforms.<platform>.tool_progress_grouping.
         "tool_progress_grouping": "accumulate",
+        # Optional native coding-progress presentation. Feishu can render one
+        # editable interactive card with ID-correlated tool status and bounded
+        # file diffs; other platforms retain the text renderer.
+        "tool_progress_style": "text",  # text | card
+        "tool_edit_display": "off",  # off | summary | diff
+        "tool_diff_visibility": "private",  # private | all
+        "tool_diff_max_files": 6,
+        "tool_diff_max_lines": 80,
+        "tool_diff_max_chars": 6000,
+        "tool_progress_max_items": 8,
+        "tool_progress_card_max_chars": 7200,
         # Optional custom phrases for generic long-running status messages.
         # Built-in defaults live in gateway/assets/status_phrases.yaml. Users
         # can set `path`/`paths` to HERMES_HOME-relative YAML files/directories

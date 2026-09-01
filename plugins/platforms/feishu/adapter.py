@@ -2152,6 +2152,38 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Interactive card send failed: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
+    async def send_coding_progress_card(
+        self,
+        chat_id: str,
+        card: Dict[str, Any],
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send the presentation-only coding-progress card for one turn."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        try:
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=json.dumps(card, ensure_ascii=False),
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            return self._finalize_send_result(response, "coding progress card send failed")
+        except Exception as exc:
+            logger.error("[Feishu] Coding progress card send failed: %s", exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    async def update_coding_progress_card(
+        self,
+        message_id: str,
+        card: Dict[str, Any],
+    ) -> SendResult:
+        """Replace an existing coding-progress card."""
+        return await self.update_interactive_message(message_id=message_id, card=card)
+
     async def send_control_panel(
         self,
         chat_id: str,

@@ -1214,6 +1214,15 @@ display:
   show_cost: false        # 在 CLI 状态栏中显示估计 $ 成本
   timestamps: false       # 为 true 时，在 CLI/TUI 记录中为用户和 assistant 标签添加 [HH:MM] 时间戳前缀
   tool_preview_length: 0  # 工具调用预览的最大字符数（0 = 无限制，显示完整路径/命令）
+  tool_progress_grouping: accumulate # Gateway：accumulate | separate
+  tool_progress_style: text          # text | card（原生卡片当前由飞书支持）
+  tool_edit_display: off             # off | summary | diff
+  tool_diff_visibility: private      # private | all（private 时群聊仅显示摘要）
+  tool_diff_max_files: 6
+  tool_diff_max_lines: 80
+  tool_diff_max_chars: 6000
+  tool_progress_max_items: 8
+  tool_progress_card_max_chars: 7200
   runtime_footer:         # Gateway：在最终回复中附加运行时上下文页脚
     enabled: false
     fields: ["model", "context_pct", "cwd"]

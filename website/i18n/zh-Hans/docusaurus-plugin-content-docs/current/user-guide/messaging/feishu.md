@@ -241,6 +241,35 @@ FEISHU_ALLOW_BOTS=mentions   # 默认：none
 
 授予 `application:bot.basic_info:read` 权限范围可显示对端机器人名称；未授权时，对端机器人仍可正常路由，但显示为其 `open_id`。
 
+## 编码进度卡片
+
+飞书可以把工具执行过程显示为一张持续更新的交互式卡片，包括完整（已脱敏）的终端命令、按工具调用 ID 对应的完成状态、耗时/退出码，以及有长度限制的文件 Diff。此功能默认关闭，可按下列方式启用：
+
+```yaml
+# ~/.hermes/config.yaml
+display:
+  tool_progress_command: true
+  interim_assistant_messages: true
+  show_commentary: true
+  platforms:
+    feishu:
+      tool_progress: all
+      tool_preview_length: 1000
+      tool_progress_grouping: accumulate
+      tool_progress_style: card       # text | card
+      tool_edit_display: diff         # off | summary | diff
+      tool_diff_visibility: private   # private | all
+      tool_diff_max_files: 6
+      tool_diff_max_lines: 80
+      tool_diff_max_chars: 6000
+      tool_progress_max_items: 8
+      tool_progress_card_max_chars: 7200
+```
+
+`patch` 直接复用工具返回的 unified diff；对于本地 `write_file`，Hermes 会在写入前保存快照，并在工具完成后生成 Diff。Diff 在离开 Gateway 前会强制进行密钥脱敏和长度限制。推荐保持 `tool_diff_visibility: private`：私聊显示受限源码 Diff，群聊只显示文件名及增删行数摘要。
+
+编码进度卡片只属于展示层，不会改变工具结果、会话历史、提示词或提示词缓存。卡片永久更新失败时会自动回退到现有的飞书可编辑 Post 消息。这类卡片没有按钮，因此除普通消息发送权限外，不需要新增应用权限或事件订阅。
+
 ## 交互式卡片操作
 
 当用户点击机器人发送的交互式卡片上的按钮或与其交互时，适配器将这些操作路由为合成的 `/card` 命令事件：

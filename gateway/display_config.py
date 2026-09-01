@@ -33,6 +33,16 @@ from typing import Any
 _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
+    # Native coding-progress presentation. ``card`` is currently implemented by
+    # Feishu; every other adapter falls back to the existing text renderer.
+    "tool_progress_style": "text",  # text | card
+    "tool_edit_display": "off",  # off | summary | diff
+    "tool_diff_visibility": "private",  # private | all
+    "tool_diff_max_files": 6,
+    "tool_diff_max_lines": 80,
+    "tool_diff_max_chars": 6000,
+    "tool_progress_max_items": 8,
+    "tool_progress_card_max_chars": 7200,
     "show_reasoning": False,
     # How a reasoning/thinking summary is rendered when show_reasoning is on.
     #   "code"      -> 💭 **Reasoning:** + fenced code block (legacy default)
@@ -311,6 +321,26 @@ def _normalise(setting: str, value: Any) -> Any:
     if setting == "tool_progress_grouping":
         val = str(value).lower()
         return val if val in ("accumulate", "separate") else "accumulate"
+    if setting == "tool_progress_style":
+        val = str(value).strip().lower()
+        return val if val in {"text", "card"} else "text"
+    if setting == "tool_edit_display":
+        val = str(value).strip().lower()
+        return val if val in {"off", "summary", "diff"} else "off"
+    if setting == "tool_diff_visibility":
+        val = str(value).strip().lower()
+        return val if val in {"private", "all"} else "private"
+    if setting in {
+        "tool_diff_max_files",
+        "tool_diff_max_lines",
+        "tool_diff_max_chars",
+        "tool_progress_max_items",
+        "tool_progress_card_max_chars",
+    }:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return int(_GLOBAL_DEFAULTS.get(setting, 0))
     if setting == "reasoning_style":
         val = str(value).lower()
         return val if val in ("code", "blockquote", "subtext") else "code"
