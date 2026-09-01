@@ -171,7 +171,7 @@ def render_progress_card(
     else:
         template, state = "blue", "Working"
     return {
-        "config": {"wide_screen_mode": True},
+        "config": {"wide_screen_mode": True, "update_multi": True},
         "header": {
             "title": {
                 "tag": "plain_text",
@@ -181,13 +181,16 @@ def render_progress_card(
         },
         "elements": [
             {
-                "tag": "markdown",
-                "content": _render_markdown(
-                    materialized,
-                    edit_display=edit_display,
-                    max_items=max(1, int(max_items or 1)),
-                    max_chars=max(500, int(max_chars or 7200)),
-                ),
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": _render_markdown(
+                        materialized,
+                        edit_display=edit_display,
+                        max_items=max(1, int(max_items or 1)),
+                        max_chars=max(500, int(max_chars or 7200)),
+                    ),
+                },
             }
         ],
     }

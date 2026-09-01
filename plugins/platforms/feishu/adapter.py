@@ -103,6 +103,8 @@ GetMessageResourceRequest = None  # type: ignore[assignment]
 P2ImMessageMessageReadV1 = None  # type: ignore[assignment]
 ReplyMessageRequest = None  # type: ignore[assignment]
 ReplyMessageRequestBody = None  # type: ignore[assignment]
+PatchMessageRequest = None  # type: ignore[assignment]
+PatchMessageRequestBody = None  # type: ignore[assignment]
 UpdateMessageRequest = None  # type: ignore[assignment]
 UpdateMessageRequestBody = None  # type: ignore[assignment]
 AccessTokenType = None  # type: ignore[assignment]
@@ -1493,6 +1495,7 @@ def _load_lark_oapi() -> bool:
                 GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
                 P2ImMessageMessageReadV1,
                 ReplyMessageRequest, ReplyMessageRequestBody,
+                PatchMessageRequest, PatchMessageRequestBody,
                 UpdateMessageRequest, UpdateMessageRequestBody,
             )
             from lark_oapi.core import AccessTokenType, HttpMethod
@@ -1522,6 +1525,8 @@ def _load_lark_oapi() -> bool:
             "P2ImMessageMessageReadV1": P2ImMessageMessageReadV1,
             "ReplyMessageRequest": ReplyMessageRequest,
             "ReplyMessageRequestBody": ReplyMessageRequestBody,
+            "PatchMessageRequest": PatchMessageRequest,
+            "PatchMessageRequestBody": PatchMessageRequestBody,
             "UpdateMessageRequest": UpdateMessageRequest,
             "UpdateMessageRequestBody": UpdateMessageRequestBody,
             "AccessTokenType": AccessTokenType,
@@ -2181,8 +2186,8 @@ class FeishuAdapter(BasePlatformAdapter):
         message_id: str,
         card: Dict[str, Any],
     ) -> SendResult:
-        """Replace an existing coding-progress card."""
-        return await self.update_interactive_message(message_id=message_id, card=card)
+        """Patch an existing shared coding-progress card in place."""
+        return await self.patch_interactive_message(message_id=message_id, card=card)
 
     async def send_control_panel(
         self,
@@ -2313,6 +2318,34 @@ class FeishuAdapter(BasePlatformAdapter):
             return open_id
         source_id = str(getattr(getattr(event, "source", None), "user_id", "") or "").strip()
         return source_id if source_id.startswith("ou_") else ""
+
+    async def patch_interactive_message(
+        self,
+        *,
+        message_id: str,
+        card: Dict[str, Any],
+    ) -> SendResult:
+        """Patch a shared interactive card via Feishu's card-specific API."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        if not message_id:
+            return SendResult(success=False, error="Missing interactive message_id")
+        try:
+            body = self._build_patch_message_body(
+                content=json.dumps(card, ensure_ascii=False)
+            )
+            request = self._build_patch_message_request(message_id, body)
+            response = await self._run_blocking(
+                self._client.im.v1.message.patch,
+                request,
+            )
+            result = self._finalize_send_result(response, "interactive patch failed")
+            if result.success:
+                result.message_id = message_id
+            return result
+        except Exception as exc:
+            logger.error("[Feishu] Interactive card patch failed: %s", exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
 
     async def update_interactive_message(
         self,
@@ -5707,6 +5740,23 @@ class FeishuAdapter(BasePlatformAdapter):
         if ReplyMessageRequest is not None:
             return (
                 ReplyMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(request_body)
+                .build()
+            )
+        return SimpleNamespace(message_id=message_id, request_body=request_body)
+
+    @staticmethod
+    def _build_patch_message_body(*, content: str) -> Any:
+        if PatchMessageRequestBody is not None:
+            return PatchMessageRequestBody.builder().content(content).build()
+        return SimpleNamespace(content=content)
+
+    @staticmethod
+    def _build_patch_message_request(message_id: str, request_body: Any) -> Any:
+        if PatchMessageRequest is not None:
+            return (
+                PatchMessageRequest.builder()
                 .message_id(message_id)
                 .request_body(request_body)
                 .build()

@@ -151,7 +151,7 @@ def test_progress_card_renders_terminal_status_and_diff():
         edit_display="diff",
     )
     assert card["header"]["template"] == "green"
-    content = card["elements"][0]["content"]
+    content = card["elements"][0]["text"]["content"]
     assert "pytest -q" in content
     assert "exit 0" in content
     assert "app.py" in content
@@ -251,6 +251,43 @@ async def test_native_feishu_sender_falls_back_to_editable_post():
     assert adapter.sent
     assert "Hermes Coding Progress" in adapter.sent[0][1]
     assert "pytest -q" in adapter.sent[0][1]
+
+
+@pytest.mark.asyncio
+async def test_feishu_adapter_patches_coding_card_with_card_specific_api():
+    from plugins.platforms.feishu.adapter import FeishuAdapter
+
+    adapter = object.__new__(FeishuAdapter)
+    patch_operation = object()
+    adapter._client = SimpleNamespace(
+        im=SimpleNamespace(
+            v1=SimpleNamespace(message=SimpleNamespace(patch=patch_operation))
+        )
+    )
+    captured = {}
+
+    async def fake_run(func, *args):
+        captured["operation"] = func
+        captured["request"] = args[0]
+        return object()
+
+    adapter._run_blocking = fake_run
+    adapter._finalize_send_result = lambda response, default_message: SendResult(
+        success=True, message_id=None
+    )
+    card = render_progress_card(
+        [{"tool_name": "read_file", "status": "success", "preview": "demo.py"}],
+        finalized=True,
+    )
+    result = await adapter.update_coding_progress_card("om_123", card)
+
+    assert result.success is True
+    assert result.message_id == "om_123"
+    assert captured["operation"] is patch_operation
+    request = captured["request"]
+    assert request.message_id == "om_123"
+    payload = json.loads(request.request_body.content)
+    assert payload["config"]["update_multi"] is True
 
 
 @pytest.mark.asyncio
@@ -372,4 +409,4 @@ async def test_native_feishu_sender_accumulates_and_finalizes_one_card():
     assert adapter.updates
     final_card = adapter.updates[-1][1]
     assert final_card["header"]["template"] == "green"
-    assert "exit 0" in final_card["elements"][0]["content"]
+    assert "exit 0" in final_card["elements"][0]["text"]["content"]
