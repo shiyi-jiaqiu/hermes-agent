@@ -1162,7 +1162,11 @@ async def test_feishu_native_progress_card_is_id_correlated_and_finalized(
     assert adapter.sent == []
     final_card = adapter.progress_card_updates[-1]["card"]
     assert final_card["header"]["template"] == "red"
-    content = final_card["elements"][0]["text"]["content"]
+    content = "\n".join(
+        element["content"]
+        for element in final_card["body"]["elements"]
+        if element.get("tag") == "markdown"
+    )
     assert "alpha" in content
     assert "beta" in content
     assert "✗" in content

@@ -243,7 +243,7 @@ FEISHU_ALLOW_BOTS=mentions   # 默认：none
 
 ## 编码进度卡片
 
-飞书可以把工具执行过程显示为一张持续更新的交互式卡片，包括完整（已脱敏）的终端命令、按工具调用 ID 对应的完成状态、耗时/退出码，以及有长度限制的文件 Diff。此功能默认关闭，可按下列方式启用：
+飞书可以把工具执行过程显示为一张持续更新的交互式卡片，包括完整（已脱敏）的终端命令、按工具调用 ID 对应的完成状态、耗时/退出码，以及有长度限制的文件 Diff。卡片采用飞书 Card JSON 2.0，每个工具对应一个独立的原生 Markdown 组件：Terminal 命令使用 `bash` 代码块、文件改动使用 `diff` 代码块，搜索/读取参数以带标签的字段逐行展示，不再用分号拼成一行。代码块样式、复制按钮及客户端支持的语法高亮均由飞书原生提供，不需要 HTML 或第三方渲染器。此功能默认关闭，可按下列方式启用：
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -262,7 +262,7 @@ display:
       tool_diff_max_files: 6
       tool_diff_max_lines: 80
       tool_diff_max_chars: 6000
-      tool_progress_max_items: 8
+      tool_progress_max_items: 4
       tool_progress_card_max_chars: 7200
 ```
 

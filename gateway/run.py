@@ -870,6 +870,35 @@ def _redact_gateway_user_facing_secrets(text: str) -> str:
     return redacted
 
 
+def _redact_gateway_display_value(value: Any) -> Any:
+    """Recursively redact tool arguments before they enter progress UI state.
+
+    Tool execution and local diff capture still receive the original argument
+    object.  Only the copy queued for chat presentation crosses this mandatory
+    egress boundary.  URL credentials are stripped here as well because a
+    progress card is diagnostic output, not a navigation surface.
+    """
+    if isinstance(value, dict):
+        return {str(key): _redact_gateway_display_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_gateway_display_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_gateway_display_value(item) for item in value)
+    if not isinstance(value, str):
+        return value
+    redacted = _redact_gateway_user_facing_secrets(value)
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(
+            redacted,
+            force=True,
+            redact_url_credentials=True,
+        )
+    except Exception:
+        return redacted
+
+
 def _redact_approval_command(cmd: "str | None") -> str:
     """Redact credentials from a command before it goes into an approval prompt.
 
@@ -5813,13 +5842,14 @@ class TurnRunner:
         from agent.display import build_tool_preview
 
         call_key = str(call_id or "")
-        safe_args = args if isinstance(args, dict) else {}
+        raw_args = args if isinstance(args, dict) else {}
+        display_args = _redact_gateway_display_value(raw_args)
         ctx._native_tool_started_at[call_key] = time.monotonic()
         if ctx._native_feishu_progress_card and ctx._tool_edit_display != "off":
             try:
                 from agent.display import capture_local_edit_snapshot
 
-                snapshot = capture_local_edit_snapshot(str(tool_name or "tool"), safe_args)
+                snapshot = capture_local_edit_snapshot(str(tool_name or "tool"), raw_args)
                 if snapshot is not None:
                     ctx._native_edit_snapshots[call_key] = snapshot
             except Exception:
@@ -5830,9 +5860,9 @@ class TurnRunner:
                 "type": "tool.started",
                 "tool_call_id": call_key,
                 "tool_name": str(tool_name or "tool"),
-                "args": safe_args,
+                "args": display_args,
                 "preview": build_tool_preview(
-                    str(tool_name or "tool"), safe_args, max_len=1000
+                    str(tool_name or "tool"), display_args, max_len=1000
                 )
                 or "",
             }
@@ -5853,7 +5883,8 @@ class TurnRunner:
 
         call_key = str(call_id or "")
         tool_key = str(tool_name or "tool")
-        safe_args = args if isinstance(args, dict) else {}
+        raw_args = args if isinstance(args, dict) else {}
+        display_args = _redact_gateway_display_value(raw_args)
         started_at = ctx._native_tool_started_at.pop(call_key, None)
         duration = (
             max(0.0, time.monotonic() - started_at)
@@ -5889,7 +5920,7 @@ class TurnRunner:
                 diff_summary = build_edit_diff_summary(
                     tool_key,
                     result if isinstance(result, str) else str(result or ""),
-                    function_args=safe_args,
+                    function_args=raw_args,
                     snapshot=snapshot,
                     max_files=ctx._tool_diff_max_files,
                     max_lines=(ctx._tool_diff_max_lines if include_diff_body else 0),
@@ -5906,7 +5937,7 @@ class TurnRunner:
                 "type": "tool.completed",
                 "tool_call_id": call_key,
                 "tool_name": tool_key,
-                "args": safe_args,
+                "args": display_args,
                 "is_error": bool(is_error),
                 "duration": duration,
                 "exit_code": exit_code,
@@ -30670,8 +30701,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_config, platform_key, "tool_diff_max_chars", 6000
         ) or 0)
         _tool_progress_max_items = int(resolve_display_setting(
-            user_config, platform_key, "tool_progress_max_items", 8
-        ) or 8)
+            user_config, platform_key, "tool_progress_max_items", 4
+        ) or 4)
         _tool_progress_card_max_chars = int(resolve_display_setting(
             user_config, platform_key, "tool_progress_card_max_chars", 7200
         ) or 7200)

@@ -14,6 +14,18 @@ from gateway.turn_context import TurnContext
 from plugins.platforms.feishu.progress import render_progress_card
 
 
+def _card_markdown(card: dict[str, Any]) -> list[str]:
+    return [
+        element["content"]
+        for element in card["body"]["elements"]
+        if element.get("tag") == "markdown"
+    ]
+
+
+def _card_content(card: dict[str, Any]) -> str:
+    return "\n".join(_card_markdown(card))
+
+
 def test_feishu_coding_progress_config_normalizes_values():
     config = {
         "display": {
@@ -31,6 +43,28 @@ def test_feishu_coding_progress_config_normalizes_values():
     assert resolve_display_setting(config, "feishu", "tool_edit_display") == "diff"
     assert resolve_display_setting(config, "feishu", "tool_diff_visibility") == "all"
     assert resolve_display_setting(config, "feishu", "tool_diff_max_lines") == 42
+    assert resolve_display_setting({}, "feishu", "tool_progress_max_items") == 4
+
+
+def test_progress_card_default_mobile_window_shows_latest_four_tools():
+    card = render_progress_card(
+        [
+            {
+                "call_id": f"call-{index}",
+                "tool_name": "read_file",
+                "args": {"path": f"file-{index}.py"},
+                "status": "success",
+            }
+            for index in range(6)
+        ],
+        finalized=True,
+    )
+    content = _card_content(card)
+    assert "2 earlier tool call(s) hidden" in content
+    assert "file-0.py" not in content
+    assert "file-1.py" not in content
+    assert "file-2.py" in content
+    assert "file-5.py" in content
 
 
 def test_parse_unified_diff_classifies_files_and_counts_changes():
@@ -150,13 +184,100 @@ def test_progress_card_renders_terminal_status_and_diff():
         finalized=True,
         edit_display="diff",
     )
+    assert card["schema"] == "2.0"
     assert card["header"]["template"] == "green"
-    content = card["elements"][0]["text"]["content"]
-    assert "pytest -q" in content
+    assert "elements" not in card
+    elements = card["body"]["elements"]
+    assert [element["tag"] for element in elements] == ["markdown", "hr", "markdown"]
+    content = _card_content(card)
+    assert "```bash\npytest -q\n```" in content
     assert "exit 0" in content
     assert "app.py" in content
     assert "+1 -1" in content
     assert "```diff" in content
+    assert "<text_tag color='green'>Success</text_tag>" in content
+
+
+def test_progress_card_renders_search_parameters_as_structured_lines():
+    card = render_progress_card(
+        [
+            {
+                "tool_name": "search_files",
+                "args": {
+                    "pattern": 'progress_mode == "new" | progress_mode == "all"',
+                    "path": "gateway/run.py",
+                    "file_glob": "*.py",
+                },
+                "preview": 'progress_mode == "new"; path=gateway/run.py; glob=*.py',
+                "status": "success",
+            }
+        ],
+        finalized=True,
+    )
+    content = _card_content(card)
+    assert "**Pattern**" in content
+    assert "**Path**" in content
+    assert "**File filter**" in content
+    assert "`; path=" not in content
+    assert "progress_mode ==" in content
+
+
+def test_progress_card_preserves_diff_context_and_never_cuts_code_fences():
+    summary = parse_unified_diff(
+        "--- a/app.py\n+++ b/app.py\n@@ -1,2 +1,2 @@\n context\n-old\n+new\n",
+        redact=False,
+    )
+    items = [
+        {
+            "tool_name": "terminal",
+            "args": {"command": "python -c " + "x" * 1500},
+            "status": "success",
+        },
+        {
+            "tool_name": "patch",
+            "args": {"path": "app.py"},
+            "status": "success",
+            "diff": summary,
+        },
+    ]
+    full_card = render_progress_card(
+        items,
+        finalized=True,
+        edit_display="diff",
+        max_chars=7200,
+    )
+    assert "\n context\n" in _card_content(full_card)
+
+    bounded_card = render_progress_card(
+        items,
+        finalized=True,
+        edit_display="diff",
+        max_chars=500,
+    )
+    assert all(block.count("```") % 2 == 0 for block in _card_markdown(bounded_card))
+
+
+def test_progress_card_redacts_terminal_secret_and_url_credentials():
+    secret = "sk-" + "a" * 32
+    card = render_progress_card(
+        [
+            {
+                "tool_name": "terminal",
+                "args": {
+                    "command": (
+                        f"OPENAI_API_KEY={secret} curl "
+                        "https://user:password@example.com/path?token=visible-secret"
+                    )
+                },
+                "status": "running",
+            }
+        ]
+    )
+    content = _card_content(card)
+    assert secret not in content
+    assert "password" not in content
+    assert "visible-secret" not in content
+    assert "```bash" in content
 
 
 class _CardAdapter:
@@ -291,6 +412,30 @@ async def test_feishu_adapter_patches_coding_card_with_card_specific_api():
 
 
 @pytest.mark.asyncio
+async def test_native_callback_redacts_args_before_progress_queue():
+    from gateway.run import TurnRunner
+
+    secret = "sk-" + "b" * 32
+    q = queue.Queue()
+    ctx = TurnContext(
+        source=SimpleNamespace(chat_id="oc_test", chat_type="dm"),
+        _run_still_current=lambda: True,
+        progress_queue=q,
+        _native_feishu_progress_card=True,
+    )
+    turn = TurnRunner(cast(Any, SimpleNamespace()), ctx)
+    turn.native_tool_start_callback(
+        "call-terminal",
+        "terminal",
+        {"command": f"OPENAI_API_KEY={secret} pytest -q"},
+    )
+    started = q.get_nowait()
+    visible = json.dumps(started["args"], ensure_ascii=False)
+    assert secret not in visible
+    assert "pytest -q" in visible
+
+
+@pytest.mark.asyncio
 async def test_native_callbacks_correlate_ids_and_capture_write_file_diff(tmp_path):
     from gateway.run import TurnRunner
 
@@ -409,4 +554,4 @@ async def test_native_feishu_sender_accumulates_and_finalizes_one_card():
     assert adapter.updates
     final_card = adapter.updates[-1][1]
     assert final_card["header"]["template"] == "green"
-    assert "exit 0" in final_card["elements"][0]["text"]["content"]
+    assert "exit 0" in _card_content(final_card)

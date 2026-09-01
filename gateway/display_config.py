@@ -41,7 +41,7 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_diff_max_files": 6,
     "tool_diff_max_lines": 80,
     "tool_diff_max_chars": 6000,
-    "tool_progress_max_items": 8,
+    "tool_progress_max_items": 4,
     "tool_progress_card_max_chars": 7200,
     "show_reasoning": False,
     # How a reasoning/thinking summary is rendered when show_reasoning is on.

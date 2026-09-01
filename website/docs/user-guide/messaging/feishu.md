@@ -279,7 +279,12 @@ Grant the `application:bot.basic_info:read` scope to display peer bot names; wit
 
 Feishu can present tool execution as one editable interactive card with full
 (redacted) terminal commands, ID-correlated completion state, duration/exit
-code, and bounded file-edit diffs. This is opt-in:
+code, and bounded file-edit diffs. Cards use Feishu Card JSON 2.0 with one
+native Markdown component per tool: terminal commands render as `bash` code
+blocks, file changes as `diff` blocks, and search/read arguments as labeled
+fields rather than a semicolon-joined line. Feishu clients provide the code
+block styling, copy control, and supported syntax highlighting; no HTML or
+third-party renderer is required. This is opt-in:
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -298,7 +303,7 @@ display:
       tool_diff_max_files: 6
       tool_diff_max_lines: 80
       tool_diff_max_chars: 6000
-      tool_progress_max_items: 8
+      tool_progress_max_items: 4
       tool_progress_card_max_chars: 7200
 ```
 

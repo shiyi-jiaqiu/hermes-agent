@@ -150,7 +150,7 @@ class TurnContext:
     _tool_diff_max_files: int = 6
     _tool_diff_max_lines: int = 80
     _tool_diff_max_chars: int = 6000
-    _tool_progress_max_items: int = 8
+    _tool_progress_max_items: int = 4
     _tool_progress_card_max_chars: int = 7200
     _native_tool_started_at: dict = field(default_factory=dict)
     _native_edit_snapshots: dict = field(default_factory=dict)

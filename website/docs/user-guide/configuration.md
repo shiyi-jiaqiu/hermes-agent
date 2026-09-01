@@ -1883,7 +1883,7 @@ display:
   tool_diff_max_files: 6
   tool_diff_max_lines: 80
   tool_diff_max_chars: 6000
-  tool_progress_max_items: 8
+  tool_progress_max_items: 4
   tool_progress_card_max_chars: 7200
   turn_summary: true      # CLI only: print a one-line post-turn accounting footer after each interactive turn
   spinner_token_flow: true # CLI only: append live cumulative turn tokens to the spinner timer
