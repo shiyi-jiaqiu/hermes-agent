@@ -236,6 +236,11 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         # group @mention message delivery over WebSocket.
         mock_ws_client.assert_called_once()
         call_kwargs = mock_ws_client.call_args.kwargs
+        self.assertEqual(
+            call_kwargs["log_level"],
+            "WARNING",
+            "Feishu WS INFO logs include credential-bearing connection URLs",
+        )
         self.assertIn("extra_ua_tags", call_kwargs,
                       "FeishuWSClient must receive extra_ua_tags for group @mention delivery")
         self.assertEqual(call_kwargs["extra_ua_tags"], ["channel"],
@@ -2465,5 +2470,4 @@ class TestChatLockEviction(unittest.TestCase):
 
         adapter = self._make_adapter()
         self.assertIsInstance(adapter._chat_locks, _collections.OrderedDict)
-
 

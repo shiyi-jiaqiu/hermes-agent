@@ -57,6 +57,18 @@ def _make_codex_agent(tmp_path, monkeypatch):
     return agent
 
 
+def test_small_codex_stream_idle_default_allows_normal_reasoning_pauses():
+    """A sub-10k request must tolerate the 15s pauses seen from GPT-5.6.
+
+    The old 12s default made Hermes close a healthy Codex response stream;
+    the worker then surfaced that intentional close as ``Broken pipe`` and
+    the retry loop repeated the same false positive three times.
+    """
+    from agent.chat_completion_helpers import codex_event_stale_timeout_default
+
+    assert codex_event_stale_timeout_default(7_116) >= 60.0
+
+
 
 
 
@@ -345,7 +357,6 @@ def test_large_codex_request_hard_ceiling_reclaims_silent_stall(tmp_path, monkey
         assert "with no response" in str(excinfo.value)
     finally:
         stop["flag"] = True
-
 
 
 

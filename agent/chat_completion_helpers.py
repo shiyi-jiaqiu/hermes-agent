@@ -537,6 +537,22 @@ def openai_codex_stale_timeout_floor(est_tokens: int) -> float:
     return 0.0
 
 
+def codex_event_stale_timeout_default(est_tokens: int) -> float:
+    """Default maximum gap between valid Codex SSE events.
+
+    GPT-5.6 streams can legitimately pause between events while reasoning or
+    while synchronous safeguards run.  A 12-second small-request default was
+    shorter than pauses observed in production and made Hermes close healthy
+    streams itself, which the worker then reported as ``Broken pipe``.  Keep a
+    60-second floor while retaining longer context-scaled windows.
+    """
+    if est_tokens > 100_000:
+        return 180.0
+    if est_tokens > 50_000:
+        return 120.0
+    return 60.0
+
+
 def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
     """Return a normalized OpenRouter provider.sort value or None."""
     if not isinstance(raw_sort, str):
@@ -1587,14 +1603,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
     ):
         _stale_timeout = min(_stale_timeout, _codex_hard_timeout)
 
-    if _est_tokens_for_codex_watchdog > 100_000:
-        _codex_idle_timeout_default = 180.0
-    elif _est_tokens_for_codex_watchdog > 50_000:
-        _codex_idle_timeout_default = 120.0
-    elif _est_tokens_for_codex_watchdog > 10_000:
-        _codex_idle_timeout_default = 60.0
-    else:
-        _codex_idle_timeout_default = 12.0
+    _codex_idle_timeout_default = codex_event_stale_timeout_default(
+        _est_tokens_for_codex_watchdog
+    )
 
     # No-byte TTFB cutoff. The OpenAI SDK's own streaming read timeout is far
     # longer (openai 2.x DEFAULT_TIMEOUT.read = 600s), so a tight 12s default
