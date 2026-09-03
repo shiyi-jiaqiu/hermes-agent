@@ -2277,6 +2277,7 @@ def switch_model(
             # still resolves for an ollama.com alias while OPENROUTER_API_KEY
             # never reaches an unrelated host.
             _alias_key = direct_alias_api_key(_da)
+            _alias_runtime: dict[str, Any] = {}
             if _alias_key:
                 # The alias states its own credential: nothing left to
                 # resolve, and re-entering the resolver would only risk a
@@ -2322,7 +2323,21 @@ def switch_model(
                     or (api_key if _same_host else "")
                     or "no-key-required"
                 )
-            api_mode = ""  # clear so determine_api_mode re-detects from URL
+            # Keep the API mode resolved from the alias's declared provider.
+            # A named custom provider can explicitly select a transport (for
+            # example ``cpa-gemini: codex_responses``), while its endpoint URL
+            # is intentionally generic and cannot be identified by
+            # ``determine_api_mode``. Clearing that mode here silently routed
+            # direct aliases back to ``chat_completions`` (#cpa-gemini).
+            # The resolver above is authoritative; the final host-mandate
+            # check below still overrides it for endpoints such as OpenAI.
+            #
+            # For the branch that had to re-resolve the alias endpoint,
+            # prefer the alias resolver's mode explicitly. In the other
+            # branches ``api_mode`` already came from the target provider's
+            # runtime resolution.
+            if isinstance(_alias_runtime, dict) and _alias_runtime.get("api_mode"):
+                api_mode = _alias_runtime["api_mode"]
             # Upstream's providers.ollama refinement: pick up the
             # configured key only for the configured native root, and drop
             # both the key and the provider-level headers for any other

@@ -36,6 +36,7 @@ from agent.reasoning_effort import (
     XAI_LEGACY_EFFORTS,
     clamp_effort,
     codex_supported_efforts,
+    gemini_supported_efforts,
 )
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
@@ -637,6 +638,13 @@ class ResponsesApiTransport(ProviderTransport):
                     reasoning_enabled = False
                 else:
                     _supported = _declared
+            if _supported is None:
+                # Gemini 3 model IDs use a narrower, model-specific
+                # thinkingLevel vocabulary than the generic Codex ladder.
+                # CPA's Responses endpoint translates this ``reasoning`` field
+                # to Gemini thinking levels, so do not let xhigh/max leak into
+                # Gemini 3.8/3.7 Flash (or other strict Gemini families).
+                _supported = gemini_supported_efforts(model)
             if _supported is None:
                 # OpenAI/Codex Responses backend — per-model vocabulary
                 # (live-verified: "max" is gpt-5.6-only, "minimal" always

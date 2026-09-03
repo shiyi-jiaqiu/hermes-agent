@@ -19,6 +19,7 @@ from agent.reasoning_effort import (
     OPENAI_COMPAT_WIRE_EFFORTS,
     TOKENHUB_EFFORTS,
     clamp_effort,
+    gemini_supported_efforts,
     kimi_supported_efforts,
     requested_effort,
 )
@@ -226,24 +227,17 @@ def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> 
     if normalized_model.startswith("gemini-2.5-"):
         return thinking_config
 
+    # Gemini 3 models use a model-specific thinkingLevel vocabulary. Keep the
+    # same clamp policy as the Responses transport so native Gemini and the
+    # CPA Responses bridge cannot disagree (for example, Gemini 3.8/3.7 Flash
+    # reject ``minimal`` while Gemini 3.6/3.5 Flash accepts it).
     if effort not in {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
         effort = "medium"
-
-    # Gemini 3 Flash documents low/medium/high thinking levels; Gemini 3 Pro
-    # is stricter (low/high). Clamp Hermes' wider effort set to what each
-    # family accepts so we never forward an undocumented level verbatim.
-    if normalized_model.startswith(("gemini-3", "gemini-3.1")):
-        if "flash" in normalized_model:
-            if effort in {"minimal", "low"}:
-                thinking_config["thinkingLevel"] = "low"
-            elif effort in {"high", "xhigh", "max", "ultra"}:
-                thinking_config["thinkingLevel"] = "high"
-            else:
-                thinking_config["thinkingLevel"] = "medium"
-        elif "pro" in normalized_model:
-            thinking_config["thinkingLevel"] = (
-                "high" if effort in {"high", "xhigh", "max", "ultra"} else "low"
-            )
+    supported = gemini_supported_efforts(normalized_model)
+    if supported is not None:
+        wire_effort = clamp_effort(effort, supported)
+        if wire_effort:
+            thinking_config["thinkingLevel"] = wire_effort
 
     return thinking_config
 

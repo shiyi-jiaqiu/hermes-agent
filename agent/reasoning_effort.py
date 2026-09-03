@@ -72,6 +72,54 @@ CODEX_LEGACY_EFFORTS: tuple[str, ...] = (
     "none", "low", "medium", "high", "xhigh",
 )
 
+#: Gemini 3.x uses a string thinking-level enum on the native API. These
+#: vocabularies are also the levels accepted by the CPA Responses translator
+#: for the corresponding Gemini model families. ``minimal`` is deliberately
+#: absent for Gemini 3.8/3.7 Flash and Gemini 3.1 Pro; those models require at
+#: least ``low``. Gemini 2.5 is intentionally not included here: its native
+#: control is the numeric ``thinkingBudget`` (not a level), and a generic
+#: Responses relay must declare its own translation before Hermes can safely
+#: synthesize one.
+GEMINI_3_8_3_7_FLASH_EFFORTS: tuple[str, ...] = ("low", "medium", "high")
+GEMINI_3_6_3_5_FLASH_EFFORTS: tuple[str, ...] = (
+    "minimal", "low", "medium", "high",
+)
+GEMINI_3_1_PRO_EFFORTS: tuple[str, ...] = ("low", "medium", "high")
+GEMINI_3_1_FLASH_LITE_IMAGE_EFFORTS: tuple[str, ...] = ("minimal", "high")
+GEMINI_3_FLASH_LITE_EFFORTS: tuple[str, ...] = (
+    "minimal", "low", "medium", "high",
+)
+GEMINI_3_PRO_EFFORTS: tuple[str, ...] = ("low", "high")
+GEMINI_3_FLASH_EFFORTS: tuple[str, ...] = (
+    "minimal", "low", "medium", "high",
+)
+
+
+def gemini_supported_efforts(model: Optional[str]) -> Optional[tuple[str, ...]]:
+    """Return the documented Gemini 3 thinking-level vocabulary.
+
+    ``None`` means that the model either is not a Gemini model or uses the
+    Gemini 2.5 numeric ``thinkingBudget`` control. Callers must not turn that
+    unknown/native-budget case into a guessed level mapping.
+    """
+    name = str(model or "").strip().lower().rsplit("/", 1)[-1]
+    if not name.startswith("gemini-"):
+        return None
+    if name.startswith(("gemini-3.8-flash", "gemini-3.7-flash")):
+        return GEMINI_3_8_3_7_FLASH_EFFORTS
+    if "flash-lite-image" in name and name.startswith("gemini-3.1"):
+        return GEMINI_3_1_FLASH_LITE_IMAGE_EFFORTS
+    if "flash-lite" in name and name.startswith(("gemini-3.1", "gemini-3.5")):
+        return GEMINI_3_FLASH_LITE_EFFORTS
+    if name.startswith("gemini-3.1-pro"):
+        return GEMINI_3_1_PRO_EFFORTS
+    if name.startswith(("gemini-3-pro", "gemini-3.0-pro")):
+        return GEMINI_3_PRO_EFFORTS
+    if name.startswith(("gemini-3.6-flash", "gemini-3.5-flash")):
+        return GEMINI_3_6_3_5_FLASH_EFFORTS
+    if name.startswith(("gemini-3-flash", "gemini-3.0-flash")):
+        return GEMINI_3_FLASH_EFFORTS
+    return None
 
 def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     """Supported effort set for an OpenAI/Codex Responses model."""
