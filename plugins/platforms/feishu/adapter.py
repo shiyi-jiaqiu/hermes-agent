@@ -397,6 +397,8 @@ class FeishuAdapterSettings:
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
     allow_all_dm: bool = False  # resolved per-profile so multiplexed adapters honor their own .env
+    menu_default_chat_id: str = ""
+    menu_routes: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -1417,6 +1419,12 @@ class FeishuAdapter(BasePlatformAdapter):
             default_group_policy=str(extra.get("default_group_policy", "")).strip().lower(),
             group_rules=group_rules, allow_bots=allow_bots, allow_all_dm=allow_all_dm,
             require_mention=_to_boolean(extra.get("require_mention", _get_scoped_secret("FEISHU_REQUIRE_MENTION", "true"))),
+            menu_default_chat_id=str(extra.get("menu_default_chat_id") or "").strip(),
+            menu_routes={
+                str(key).strip(): str(value).strip()
+                for key, value in (extra.get("menu_routes", {}) or {}).items()
+                if str(key).strip() and str(value).strip().startswith("/")
+            } if isinstance(extra.get("menu_routes", {}), dict) else {},
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1783,8 +1791,10 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc))
 
     async def _send_interactive_card(
-        self, chat_id: str, card: Dict[str, Any], metadata: Optional[Dict[str, Any]], failure_message: str, *,
-        state_map: Dict[int, Dict[str, str]], state_id: int, session_key: str,
+        self, chat_id: str, card: Dict[str, Any], metadata: Optional[Dict[str, Any]] = None,
+        failure_message: str = "interactive card send failed", *,
+        state_map: Optional[Dict[int, Dict[str, str]]] = None, state_id: Optional[int] = None,
+        session_key: str = "",
     ) -> SendResult:
         """Send a button card and, on success, remember where it went so a click can be validated."""
         response = await self._feishu_send_with_retry(
@@ -1792,7 +1802,7 @@ class FeishuAdapter(BasePlatformAdapter):
             reply_to=None, metadata=metadata,
         )
         result = self._finalize_send_result(response, failure_message)
-        if result.success:
+        if result.success and state_map is not None and state_id is not None:
             state_map[state_id] = {
                 "session_key": session_key,
                 "message_id": result.message_id or "",
@@ -1827,6 +1837,138 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[Feishu] send_update_prompt failed: %s", exc)
             return SendResult(success=False, error=str(exc))
+
+    async def send_control_panel(
+        self,
+        chat_id: str,
+        status_text: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        source: Optional[Any] = None,
+        owner_open_id: str = "",
+        initial_view: str = "home",
+    ) -> SendResult:
+        """Create the sole active stateful panel for this user/chat/thread."""
+        from plugins.platforms.feishu.panel.renderer import render_panel
+        from plugins.platforms.feishu.panel.state import PanelState
+
+        if source is None:
+            owner = str(
+                (metadata or {}).get("owner_open_id")
+                or next(iter(self._admins), "panel-owner")
+            )
+            source = self.build_source(
+                chat_id=chat_id,
+                chat_name=chat_id,
+                chat_type=str((metadata or {}).get("chat_type") or "group"),
+                user_id=owner,
+                user_name=owner,
+                thread_id=str((metadata or {}).get("thread_id") or "") or None,
+            )
+
+        if getattr(self, "gateway_runner", None) is not None:
+            state, replaced = await self._panel_controller.create_panel_state(
+                source=source,
+                session_key=session_key,
+                status_text=status_text,
+                owner_open_id=owner_open_id,
+                initial_view=initial_view,
+            )
+        else:
+            # Keep the adapter independently testable without a fully-built
+            # GatewayRunner; controls remain unavailable in that fixture.
+            state = PanelState(
+                panel_id=f"p_{uuid.uuid4().hex}",
+                message_id="",
+                app_id=self._app_id or "feishu",
+                owner_open_id=str(
+                    owner_open_id or getattr(source, "user_id", "") or "panel-owner"
+                ),
+                chat_id=str(chat_id),
+                thread_id=str(getattr(source, "thread_id", "") or ""),
+                session_key=str(session_key or ""),
+                profile=str(getattr(source, "profile", "") or "default"),
+                chat_type=str(getattr(source, "chat_type", "") or "group"),
+                user_id=str(getattr(source, "user_id", "") or ""),
+                user_id_alt=str(getattr(source, "user_id_alt", "") or ""),
+                user_name=str(getattr(source, "user_name", "") or ""),
+                data={
+                    "effective_model": "unknown",
+                    "effective_provider": "unknown",
+                    "global_model": "unknown",
+                    "global_provider": "unknown",
+                    "effective_reasoning": "default",
+                    "global_reasoning": "default",
+                    "value_source": "本会话",
+                    "preset_options": [
+                        {"name": "fast", "label": "⚡ Quick"},
+                        {"name": "daily", "label": "⚖ Daily"},
+                        {"name": "deep", "label": "🧠 Deep"},
+                    ],
+                    "model_providers": [],
+                    "model_options": [],
+                    "reasoning_options": [],
+                    "sessions": [],
+                    "status_text": str(status_text or "")[:3000],
+                },
+            )
+            if initial_view in {"model", "reasoning", "sessions", "status"}:
+                state.view = initial_view
+                state.view_stack = ["home"]
+            replaced = self._panel_store.create_active(state)
+
+        result = await self._send_interactive_card(
+            chat_id=chat_id,
+            card=render_panel(state),
+            metadata=metadata,
+        )
+        if not result.success:
+            self._panel_controller.discard(state)
+            if replaced is not None:
+                # Sending the replacement failed: restore the former panel as
+                # active so a transient Feishu API error does not strand the
+                # operator without a usable control surface.
+                replaced.active = True
+                replaced.lifecycle = "active"
+                replaced.revision = max(0, replaced.revision - 1)
+                self._panel_store.create_active(replaced)
+            return result
+        attached = self._panel_controller.attach_message_id(state, result.message_id or "")
+        if not attached:
+            logger.warning(
+                "[Feishu Panel] failed to persist message id panel=%s message=%s",
+                state.panel_id,
+                result.message_id or "<missing>",
+            )
+        load_view = self._panel_controller._load_view_name(initial_view)
+        if load_view and load_view != "home":
+            if not self._panel_controller.schedule_view_load(state.panel_id, load_view):
+                logger.warning(
+                    "[Feishu Panel] failed to schedule initial view load panel=%s view=%s",
+                    state.panel_id,
+                    load_view,
+                )
+        if replaced is not None and replaced.message_id:
+            # Best-effort read-only replacement of the old card. Its server-side
+            # active flag has already been revoked atomically.
+            await self.update_interactive_message(
+                message_id=replaced.message_id,
+                card=render_panel(replaced),
+            )
+        return result
+
+    @staticmethod
+    def control_panel_owner_id(event: MessageEvent) -> str:
+        """Return the app-scoped open_id used by card operator callbacks."""
+        raw = getattr(event, "raw_message", None)
+        raw_event = getattr(raw, "event", None)
+        sender = getattr(raw_event, "sender", None)
+        sender_id = getattr(sender, "sender_id", None)
+        open_id = str(getattr(sender_id, "open_id", "") or "").strip()
+        if open_id:
+            return open_id
+        source_id = str(getattr(getattr(event, "source", None), "user_id", "") or "").strip()
+        return source_id if source_id.startswith("ou_") else ""
 
     @staticmethod
     def _build_resolved_approval_card(*, choice: str, user_name: str) -> Dict[str, Any]:
@@ -2269,6 +2411,109 @@ class FeishuAdapter(BasePlatformAdapter):
             )
             return None
         return open_id, callback_chat_id, self._get_cached_sender_name(open_id) or open_id
+
+    def _on_bot_menu_event(self, data: Any) -> None:
+        """Schedule a DM bot-menu event into the normal gateway command path."""
+        loop = self._loop
+        if not self._loop_accepts_callbacks(loop):
+            logger.warning("[Feishu] Dropping bot menu event before adapter loop is ready")
+            return
+        self._submit_on_loop(loop, self._handle_bot_menu_event(data))
+
+    async def _handle_bot_menu_event(self, data: Any) -> None:
+        event = getattr(data, "event", None)
+        event_key = str(getattr(event, "event_key", "") or "").strip()
+        command = self._menu_routes.get(event_key)
+        if not command:
+            logger.warning("[Feishu] Ignoring unmapped bot menu event_key=%r", event_key)
+            return
+        operator = getattr(event, "operator", None)
+        operator_id = getattr(operator, "operator_id", None)
+        open_id = str(getattr(operator_id, "open_id", "") or "")
+        if not self._is_interactive_operator_authorized(open_id):
+            logger.warning("[Feishu] Unauthorized bot menu click by %s", open_id or "<unknown>")
+            return
+        chat_id = self._menu_default_chat_id
+        if not chat_id:
+            logger.error("[Feishu] menu_default_chat_id is required for bot menu routing")
+            return
+        await self._route_menu_command(
+            chat_id=chat_id,
+            open_id=open_id,
+            command=command,
+            raw_message=data,
+            thread_id=None,
+            chat_type_hint="p2p",
+        )
+
+    async def _route_menu_command(
+        self,
+        *,
+        chat_id: str,
+        open_id: str,
+        command: str,
+        raw_message: Any,
+        thread_id: Optional[str],
+        chat_type_hint: str = "group",
+    ) -> None:
+        """Create an authorized synthetic COMMAND event for a DM menu action."""
+        sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+        chat_info = await self.get_chat_info(chat_id)
+        resolved_chat_type = self._resolve_source_chat_type(
+            chat_info=chat_info,
+            event_chat_type=chat_type_hint,
+        )
+        if (
+            resolved_chat_type != "dm"
+            and not self._allow_group_message(sender_id, chat_id, is_bot=False)
+        ):
+            logger.warning("[Feishu] Unauthorized control click by %s in %s", open_id, chat_id)
+            return
+        sender_profile = await self._resolve_sender_profile(sender_id)
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
+            chat_type=resolved_chat_type,
+            user_id=sender_profile["user_id"],
+            user_name=sender_profile["user_name"],
+            thread_id=thread_id,
+            user_id_alt=sender_profile["user_id_alt"],
+        )
+        synthetic_event = MessageEvent(
+            text=command,
+            message_type=MessageType.COMMAND,
+            source=source,
+            raw_message=raw_message,
+            message_id="",
+            channel_prompt=self._resolve_channel_prompt(chat_id),
+            timestamp=datetime.now(),
+        )
+        logger.info(
+            "[Feishu] Routing menu command %s from %s in %s thread=%s",
+            command, open_id, chat_id, thread_id or "root",
+        )
+
+        # Menu callbacks bypass the normal per-profile adapter message handler.
+        # Re-enter the profile-scoped handler when multiplexing is enabled.
+        runner = getattr(self, "gateway_runner", None)
+        if runner is not None and getattr(getattr(runner, "config", None), "multiplex_profiles", False):
+            profile_name = str(getattr(source, "profile", "") or "").strip()
+            try:
+                if profile_name and profile_name != "default":
+                    handler_factory = getattr(runner, "_make_profile_message_handler", None)
+                    handler = handler_factory(profile_name) if callable(handler_factory) else None
+                else:
+                    handler_factory = getattr(runner, "_make_default_profile_message_handler", None)
+                    handler = handler_factory() if callable(handler_factory) else None
+                if handler is not None:
+                    await handler(synthetic_event)
+                    return
+            except Exception:
+                logger.warning(
+                    "[Feishu] Profile-scoped control dispatch failed; falling back to normal handler",
+                    exc_info=True,
+                )
+        await self._handle_message_with_guards(synthetic_event)
 
     def _handle_approval_card_action(self, *, event: Any, action_value: Dict[str, Any], loop: Any) -> Any:
         """Schedule approval resolution and build the synchronous callback response."""

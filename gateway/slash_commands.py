@@ -165,6 +165,44 @@ class GatewaySlashCommandsMixin(
 
     async_session_store: AsyncSessionStore
 
+    async def _handle_panel_command(self, event: MessageEvent) -> Optional[str]:
+        """Send a platform-native control card when the adapter supports it."""
+        requested_view = event.get_command_args().strip().lower() or "home"
+        if requested_view not in {"home", "model", "reasoning", "sessions", "status"}:
+            return "Usage: /panel [model|reasoning|sessions|status]"
+        source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
+        session_key = self._session_key_for_source(source)
+        adapter = self._adapter_for_source(source)
+        if adapter is None or getattr(type(adapter), "send_control_panel", None) is None:
+            return "Interactive control panels are not supported on this platform."
+        # The initial card intentionally excludes the expensive status view.
+        # Loading it here adds several session-DB reads before the card can be
+        # sent, only for create_panel_state() to discard the result.
+        status_text = ""
+        metadata = self._thread_metadata_for_source(
+            source,
+            self._reply_anchor_for_event(event),
+        )
+        try:
+            result = await adapter.send_control_panel(
+                chat_id=source.chat_id,
+                status_text=status_text,
+                session_key=session_key,
+                metadata=metadata,
+                source=source,
+                owner_open_id=str(
+                    getattr(adapter, "control_panel_owner_id", lambda _event: "")(event)
+                    or ""
+                ),
+                initial_view=requested_view,
+            )
+        except Exception as exc:
+            logger.warning("send_control_panel failed: %s", exc, exc_info=True)
+            return f"❌ Could not open control panel: {exc}"
+        if getattr(result, "success", False):
+            return None
+        return f"❌ Could not open control panel: {getattr(result, 'error', 'send failed')}"
+
     # ------------------------------------------------------------------ shared helpers
     def _cached_agent_for(self, session_key: str, *, lockless_fallback: bool = False):
         """Peek the cached AIAgent for *session_key* without evicting it, or None. Entries are
