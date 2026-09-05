@@ -96,35 +96,20 @@ class TestSubdirectoryHintTracker:
 
 
 
-    def test_truncation_of_large_hints(self, tmp_path, caplog):
-        """Over the ceiling: head AND tail survive, the marker names the file to read_file, and it is logged
-        (the old silent tail-chop hid a truncated apps/desktop/AGENTS.md for months)."""
-        import logging
-        from agent import subdirectory_hints as sh
+    def test_truncation_of_large_hints(self, tmp_path):
+        """Hint files over the limit are truncated."""
         sub = tmp_path / "bigdir"
         sub.mkdir()
-        body = "HEAD-MARKER " + ("x" * (sh._MAX_HINT_CHARS + 5_000)) + " TAIL-MARKER"
-        (sub / "AGENTS.md").write_text(body)
+        (sub / "AGENTS.md").write_text("x" * 20_000)
 
         tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
-        with caplog.at_level(logging.WARNING, logger="agent.prompt_builder"):
-            result = tracker.check_tool_call("read_file", {"path": str(sub / "file.py")})
+        result = tracker.check_tool_call(
+            "read_file", {"path": str(sub / "file.py")}
+        )
         assert result is not None
-        assert "HEAD-MARKER" in result and "TAIL-MARKER" in result
-        assert "truncated AGENTS.md" in result and "bigdir/AGENTS.md" in result
-        assert len(result) < len(body)
-        assert any("TRUNCATED" in r.message and "AGENTS.md" in r.message for r in caplog.records)
-
-    def test_area_file_under_ceiling_is_delivered_whole(self, tmp_path):
-        """An area AGENTS.md sized like ours (well under the ceiling) arrives intact — no marker."""
-        sub = tmp_path / "gateway"
-        sub.mkdir()
-        body = "# Gateway rules\n" + ("- rule\n" * 1500)   # ~12k chars: over the OLD 8k cap, under the new one
-        (sub / "AGENTS.md").write_text(body)
-        tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
-        result = tracker.check_tool_call("read_file", {"path": str(sub / "run.py")})
-        assert result is not None and "truncated" not in result.lower()
-        assert result.endswith(body.strip())
+        assert "truncated" in result.lower()
+        # Should be capped
+        assert len(result) < 20_000
 
     def test_empty_args(self, project):
         """Empty args should not crash."""

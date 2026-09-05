@@ -198,5 +198,4 @@ class TestInvalidationSitesClearTurnBaseAnchor:
         from agent import agent_init
 
         src = inspect.getsource(agent_init)
-        # Init defaults are declared in the ``_USAGE_STATE`` table.
-        assert '"_turn_base_usage_anchor": None' in src
+        assert "_turn_base_usage_anchor = None" in src

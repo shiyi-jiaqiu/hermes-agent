@@ -579,8 +579,6 @@ export const ru = defineLocale({
       },
       backdropTitle: 'Фон чата',
       backdropDesc: 'Блёклый силуэт позади диалога.',
-      userBubbleTitle: 'Пузырь сообщения',
-      userBubbleDesc: 'Насколько прозрачны ваши сообщения. 0 — сплошная заливка, 100 — остаётся только контур.',
       introSplashTitle: 'Экран приветствия',
       introSplashDesc: 'Логотип и подсказка, показываемые на пустом чате.',
       reactionsTitle: 'Реакции на сообщения',

@@ -1,8 +1,8 @@
 """Profile-local durable audit ledger for cron execution attempts.
 
-The ledger records what is known about each attempt; it is not a retry queue. Interrupted attempts
-become ``unknown`` only after their exact owner process is proved gone. Terminal states are
-immutable. Also hosts the SQLite ledger helpers shared with ``cron.incidents`` / ``cron.notepad``.
+The ledger records what is known about each attempt; it is not a retry queue.
+Interrupted attempts become ``unknown`` only after their exact owner process is
+proved gone. Terminal states are immutable.
 """
 
 from __future__ import annotations
@@ -13,15 +13,14 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
-# Optional test override. Production resolves the path at transaction time so dashboard operations
-# that temporarily enter another profile cannot leak that profile's records into the import-time
-# home.
+# Optional test override. Production resolves the path at transaction time so
+# dashboard operations that temporarily enter another profile cannot leak that
+# profile's execution records into the import-time home.
 EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
@@ -30,56 +29,21 @@ _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
 
-# --- shared SQLite ledger plumbing --------------------------------------------------------------
-
-def open_ledger(path: Path) -> sqlite3.Connection:
-    """Open a profile-local ledger DB, creating its ``cron/`` dir with the store's permissions."""
+def _connect() -> sqlite3.Connection:
     from cron.jobs import _ensure_cron_dir
 
+    path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
     _ensure_cron_dir(path.parent)
     return sqlite3.connect(path, timeout=5)
 
 
-def prepare_ledger(
-    conn: sqlite3.Connection, *, db_label: str, synchronous_full: bool = True
-) -> None:
-    """Row factory + busy timeout + WAL (with fallback) + optional ``synchronous=FULL``."""
-    from hermes_state_wal import apply_wal_with_fallback
+def _initialize_schema(conn: sqlite3.Connection) -> None:
+    from hermes_state import apply_wal_with_fallback
 
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
-    apply_wal_with_fallback(conn, db_label=db_label)
-    if synchronous_full:
-        conn.execute("PRAGMA synchronous=FULL")
-
-
-@contextmanager
-def ledger_transaction(
-    lock: threading.RLock,
-    connect: Callable[[], sqlite3.Connection],
-    initialize_schema: Callable[[sqlite3.Connection], None],
-) -> Iterator[sqlite3.Connection]:
-    """Open a connection, commit/rollback on exit, always close. ``sqlite3.Connection``'s own
-    context manager does NOT close (leaks WAL/SHM fds until GC); schema init runs inside the
-    ``try`` so a PRAGMA/DDL failure after ``connect()`` still closes."""
-    with lock:
-        conn = connect()
-        try:
-            initialize_schema(conn)
-            with conn:
-                yield conn
-        finally:
-            conn.close()
-
-
-# --- executions ledger --------------------------------------------------------------------------
-
-def _connect() -> sqlite3.Connection:
-    return open_ledger(EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db"))
-
-
-def _initialize_schema(conn: sqlite3.Connection) -> None:
-    prepare_ledger(conn, db_label="cron/executions.db")
+    apply_wal_with_fallback(conn, db_label="cron/executions.db")
+    conn.execute("PRAGMA synchronous=FULL")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS executions (
              id TEXT PRIMARY KEY,
@@ -119,12 +83,26 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
 
 @contextmanager
 def _transaction() -> Iterator[sqlite3.Connection]:
-    with ledger_transaction(_lock, _connect, _initialize_schema) as conn:
-        yield conn
+    """Open a connection, commit/rollback on exit, always close.
+
+    ``sqlite3.Connection.__enter__``/``__exit__`` only commit or roll back
+    the transaction; it does not close the connection. Relying on that alone
+    leaks a connection (and its WAL/SHM file descriptors) on every call,
+    since closing then depends on the garbage collector. Schema init runs
+    inside the ``try`` too, so a PRAGMA/DDL failure after a successful
+    ``connect()`` still closes the connection instead of leaking it.
+    """
+    with _lock:
+        conn = _connect()
+        try:
+            _initialize_schema(conn)
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
 
-def _fetch(conn: sqlite3.Connection, execution_id: str) -> Optional[Dict[str, Any]]:
-    row = conn.execute("SELECT * FROM executions WHERE id=?", (execution_id,)).fetchone()
+def _record(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
     return dict(row) if row is not None else None
 
 
@@ -162,13 +140,14 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
+    limit = max(0, int(MAX_TERMINAL_EXECUTIONS))
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
              WHERE status IN ('completed','failed','unknown')
              ORDER BY finished_at DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
-        (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
+        (limit,),
     )
 
 
@@ -186,7 +165,10 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
             (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
              _process_start_time(pid), now),
         )
-        record = _fetch(conn, execution_id)
+        row = conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone()
+    record = _record(row)
     _emit_execution_state(record)
     return record  # type: ignore[return-value]
 
@@ -203,7 +185,9 @@ def mark_execution_handoff_pending(execution_id: str) -> Optional[Dict[str, Any]
         )
         if cur.rowcount != 1:
             return None
-        record = _fetch(conn, execution_id)
+        record = _record(conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone())
     _emit_execution_state(record)
     return record
 
@@ -229,7 +213,9 @@ def adopt_claimed_execution(execution_id: str) -> Optional[Dict[str, Any]]:
         )
         if cur.rowcount != 1:
             return None
-        record = _fetch(conn, execution_id)
+        record = _record(conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone())
     _emit_execution_state(record)
     return record
 
@@ -248,7 +234,9 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
         )
         if cur.rowcount != 1:
             return None
-        record = _fetch(conn, execution_id)
+        record = _record(conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone())
     _emit_execution_state(record)
     return record
 
@@ -273,7 +261,9 @@ def finish_execution(
         if cur.rowcount != 1:
             return None
         _prune_unlocked(conn)
-        record = _fetch(conn, execution_id)
+        record = _record(conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone())
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     return record
 
@@ -318,7 +308,9 @@ def recover_interrupted_executions() -> int:
             )
             changed += cur.rowcount
             if cur.rowcount:
-                record = _fetch(conn, row["id"])
+                record = _record(conn.execute(
+                    "SELECT * FROM executions WHERE id=?", (row["id"],)
+                ).fetchone())
                 if record is not None:
                     recovered.append(record)
         if changed:
@@ -329,7 +321,8 @@ def recover_interrupted_executions() -> int:
 
 
 def list_executions(
-    *, job_id: Optional[str] = None, limit: int = 50, before_claimed_at: Optional[str] = None,
+    *, job_id: Optional[str] = None, limit: int = 50,
+    before_claimed_at: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return indexed, newest-first execution history with cursor pagination."""
     clauses: List[str] = []

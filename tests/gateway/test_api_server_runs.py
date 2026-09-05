@@ -28,7 +28,6 @@ from gateway.platforms.api_server import (
     security_headers_middleware,
 )
 from tools import approval as approval_mod
-from tools import approval_gateway_wait
 
 
 # ---------------------------------------------------------------------------
@@ -422,12 +421,12 @@ class TestRunEvents:
                 assert auth_adapter._run_approval_sessions[attacker_run] == attacker_run
                 assert auth_adapter._run_approval_sessions[victim_run] != auth_adapter._run_approval_sessions[attacker_run]
 
-                victim_entry = approval_gateway_wait._ApprovalEntry({
+                victim_entry = approval_mod._ApprovalEntry({
                     "command": "bash -c victim-danger",
                     "description": "victim approval",
                     "pattern_keys": ["shell-c"],
                 })
-                attacker_entry = approval_gateway_wait._ApprovalEntry({
+                attacker_entry = approval_mod._ApprovalEntry({
                     "command": "bash -c attacker-danger",
                     "description": "attacker approval",
                     "pattern_keys": ["shell-c"],
@@ -653,7 +652,7 @@ class TestRunLifecycleSweep:
                 assert isinstance(task, asyncio.Task)
                 assert not task.done()
 
-                pending = approval_gateway_wait._ApprovalEntry({
+                pending = approval_mod._ApprovalEntry({
                     "command": "bash -c long-running",
                     "description": "approval after stream TTL",
                     "pattern_keys": ["shell-c"],
@@ -960,7 +959,7 @@ class TestRunsProviderAuthFailure:
 
 
 def _use_idempotency_db(adapter, path):
-    from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+    from gateway.platforms.api_server import RunIdempotencyStore
 
     adapter._run_idempotency_store.close()
     adapter._run_idempotency_store = RunIdempotencyStore(str(path))
@@ -1115,7 +1114,7 @@ class TestRunIdempotency:
         assert calls == 1
 
     def test_restart_durability_and_terminal_semantics(self, tmp_path):
-        from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+        from gateway.platforms.api_server import RunIdempotencyStore
 
         path = tmp_path / "idem.db"
         for terminal in ("completed", "failed", "cancelled"):
@@ -1142,7 +1141,7 @@ class TestRunIdempotency:
             restarted.close()
 
     def test_tenant_isolation_and_retention(self, tmp_path):
-        from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+        from gateway.platforms.api_server import RunIdempotencyStore
 
         store = RunIdempotencyStore(str(tmp_path / "idem.db"))
         assert (
@@ -1158,7 +1157,7 @@ class TestRunIdempotency:
     def test_retention_never_releases_an_active_idempotency_reservation(
         self, tmp_path
     ):
-        from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+        from gateway.platforms.api_server import RunIdempotencyStore
 
         store = RunIdempotencyStore(str(tmp_path / "idem.db"))
         with patch("gateway.platforms.api_server.time.time", return_value=100):
@@ -1229,6 +1228,51 @@ class TestRunIdempotency:
         assert record["run_id"] == "run-room"
 
         now[0] = horizon + 1
+        store.reserve(
+            "third-scope",
+            "third-key",
+            "third-fingerprint",
+            "run-third",
+            {"run_id": "run-third", "status": "queued"},
+        )
+        assert store.lookup(
+            "room-scope",
+            "room:task-1:1",
+            "room-fingerprint",
+        ) == ("missing", None)
+        store.close()
+
+    def test_explicit_home_acknowledgement_releases_terminal_receipt(
+        self, tmp_path, monkeypatch
+    ):
+        from gateway.platforms import api_server_run_idempotency as idempotency
+
+        now = [100.0]
+        monkeypatch.setattr(idempotency.time, "time", lambda: now[0])
+        store = idempotency.RunIdempotencyStore(str(tmp_path / "idem.db"))
+        assert store.reserve(
+            "room-scope",
+            "room:task-1:1",
+            "room-fingerprint",
+            "run-room",
+            {"run_id": "run-room", "status": "completed"},
+            retention_until=now[0] + 30 * 24 * 60 * 60,
+        )[0] == "created"
+        assert store.acknowledge_terminal("room-scope", "run-room") is True
+        store.reserve(
+            "other-scope",
+            "other-key",
+            "other-fingerprint",
+            "run-other",
+            {"run_id": "run-other", "status": "queued"},
+        )
+        assert store.lookup(
+            "room-scope",
+            "room:task-1:1",
+            "room-fingerprint",
+        )[0] == "reused"
+
+        now[0] += store.ACKNOWLEDGED_RETENTION_SECONDS + 1
         store.reserve(
             "third-scope",
             "third-key",
@@ -1376,7 +1420,7 @@ class TestRunIdempotency:
     async def test_dead_owner_nonterminal_status_becomes_interrupted(
         self, tmp_path
     ):
-        from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+        from gateway.platforms.api_server import RunIdempotencyStore
 
         path = tmp_path / "idem.db"
         scope = hashlib.sha256(
@@ -1467,7 +1511,7 @@ class TestHostedRoomRuns:
         self, auth_adapter
     ):
         run_id = "run-room-approval"
-        current = approval_gateway_wait._ApprovalEntry({
+        current = approval_mod._ApprovalEntry({
             "request_id": "approval-B",
             "command": "rm -rf build-B",
         })
@@ -1875,7 +1919,8 @@ class TestHostedRoomRuns:
 
         for target in (
             "gateway.platforms.api_server.time.time",
-            "gateway.hosted_rooms_common.time.time",
+            "gateway.hosted_room_peer.time.time",
+            "gateway.hosted_rooms.time.time",
         ):
             monkeypatch.setattr(target, lambda: 200)
         claims = {

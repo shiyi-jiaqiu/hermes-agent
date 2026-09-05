@@ -732,11 +732,8 @@ export function useSessionActions({
     async (
       dir: TileDock = 'right',
       options?: {
-        anchor?: string
-        before?: null | string
         cwd?: null | string
         listed?: boolean
-        profile?: string
         route?: AgentProfileRoute | null
         workspaceScope?: SessionTileWorkspaceScope
       }
@@ -750,8 +747,7 @@ export function useSessionActions({
         // `options?.cwd || resolve…` is wrong for Home: null is falsy and used
         // to fall through into the last project folder while main chat was
         // occupied (openTab path for "New session in Home").
-        const capturedRoute = options?.route !== undefined ? options.route : resolveNewChatOwnerRoute(options?.profile)
-
+        const capturedRoute = options?.route === undefined ? resolveNewChatOwnerRoute() : options.route
         const workspaceScope = options?.workspaceScope ?? { workspaceMode: 'sessions' }
 
         const cwd =
@@ -827,7 +823,7 @@ export function useSessionActions({
         const runtimeInfo = applyRuntimeInfo(created.info, { foreground: false })
         updateSessionState(created.session_id, state => (runtimeInfo ? { ...state, ...runtimeInfo } : state), stored)
 
-        openSessionTile(stored, dir, options?.anchor, options?.before, workspaceScope)
+        openSessionTile(stored, dir, undefined, undefined, workspaceScope)
         patchSessionTile(stored, { runtimeId: created.session_id })
 
         if (dir === 'center' && runtimeInfo?.cwd) {
