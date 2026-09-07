@@ -220,6 +220,20 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     surface: action('journey')
   },
 
+  // Model/reasoning presets must run against the live TUI session. Routing
+  // `/quick` through the persistent slash worker creates a second CLI state,
+  // which is the source of the Desktop-only verification/rollback mismatch.
+  // Keep the aliases on the hidden canonical `/mode` row so they execute
+  // without duplicating the model picker in the visible palette.
+  {
+    name: '/mode',
+    description: 'Apply a configured model preset (the panel Quick preset is /quick)',
+    aliases: ['/quick', '/daily', '/deep'],
+    surface: rpc('mode.apply', ctx => ({ session_id: ctx.sessionId, command: ctx.command })),
+    hidden: true,
+    argumentMode: 'mixed'
+  },
+
   // Overlay pickers
   { name: '/model', description: 'Switch the model for this session', surface: picker('model'), hidden: true },
   {

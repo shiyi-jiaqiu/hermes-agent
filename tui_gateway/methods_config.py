@@ -190,6 +190,310 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5061, str(e))
 
 
+@method("mode.apply")
+@_profile_scoped
+def _(rid, params: dict) -> dict:
+    """Apply one configured mode to the live TUI/Desktop session atomically.
+
+    Desktop slash commands must not use the detached slash worker for model
+    presets: that worker has its own CLI instance and can update a different
+    in-memory session. Reuse the existing config.set mutations here, but keep a
+    transaction boundary and verify the live session after all three settings
+    are applied.
+    """
+    from hermes_cli.mode_presets import (
+        available_mode_names,
+        format_mode_verification,
+        mode_command_fast_value,
+        resolve_mode_preset,
+    )
+    import copy
+    import shlex
+    from pathlib import Path
+
+    sid = str(params.get("session_id") or "").strip()
+    session = _sessions.get(sid)
+    if session is None:
+        return _err(rid, 4040, "session not found")
+    if session.get("running"):
+        return _ok(
+            rid,
+            {
+                "output": "❌ Mode switch is unavailable while the session is running; try again after the turn completes.",
+                "mode": "",
+            },
+        )
+
+    profile_home = session.get("profile_home")
+    if profile_home:
+        from gateway.run import _load_gateway_config
+
+        cfg = _load_gateway_config(config_path=Path(profile_home) / "config.yaml")
+    else:
+        cfg = _load_cfg()
+    raw_command = str(params.get("command") or "").strip()
+    if not raw_command:
+        requested = str(params.get("mode") or "").strip()
+        modifier = str(params.get("fast") or "").strip()
+        raw_command = f"/mode {requested} {modifier}".strip()
+    try:
+        words = shlex.split(raw_command)
+    except ValueError as exc:
+        return _ok(rid, {"output": f"❌ Invalid mode command: {exc}", "mode": ""})
+    if not words:
+        return _ok(
+            rid,
+            {
+                "output": "Usage: /mode <name> [fast|normal]",
+                "mode": "",
+            },
+        )
+
+    command_name = words.pop(0).lstrip("/").lower()
+    if command_name == "mode":
+        if not words:
+            available = ", ".join(available_mode_names(cfg)) or "none configured"
+            return _ok(
+                rid,
+                {
+                    "output": f"Usage: /mode <name> [fast|normal]\nConfigured modes: {available}",
+                    "mode": "",
+                },
+            )
+        mode_name = words.pop(0).lower()
+    else:
+        mode_name = command_name
+
+    preset = resolve_mode_preset(cfg, mode_name)
+    if preset is None:
+        available = ", ".join(available_mode_names(cfg)) or "none configured"
+        return _ok(
+            rid,
+            {
+                "output": f"❌ Unknown mode `{mode_name}`. Configured modes: {available}",
+                "mode": mode_name,
+            },
+        )
+    if len(words) > 1 or (
+        words and words[0].lower() not in {"fast", "normal", "off"}
+    ):
+        return _ok(
+            rid,
+            {
+                "output": f"❌ Usage: /{mode_name} [fast|normal]",
+                "mode": mode_name,
+            },
+        )
+    fast = mode_command_fast_value(preset, words[0] if words else None)
+
+    # A mode is a single session transaction. Keep only the mutable runtime
+    # fields; credentials are never put into the response or logs.
+    session_keys = (
+        "model_override",
+        "create_reasoning_override",
+        "create_service_tier_override",
+        "pending_model_switch",
+        "resume_runtime_overrides",
+    )
+    session_snapshot = {
+        key: (key in session, copy.deepcopy(session.get(key)))
+        for key in session_keys
+    }
+    agent = session.get("agent")
+    agent_present = "agent" in session
+    agent_keys = (
+        "model",
+        "provider",
+        "base_url",
+        "api_mode",
+        "reasoning_config",
+        "service_tier",
+        "request_overrides",
+    )
+    agent_snapshot = {
+        key: copy.deepcopy(getattr(agent, key, None))
+        for key in agent_keys
+    } if agent is not None else None
+    had_worker = session.get("slash_worker") is not None
+
+    def restore() -> None:
+        for key, (present, value) in session_snapshot.items():
+            if present:
+                session[key] = copy.deepcopy(value)
+            else:
+                session.pop(key, None)
+        if agent_present:
+            session["agent"] = agent
+        else:
+            session.pop("agent", None)
+        current_agent = agent
+        if current_agent is not None and agent_snapshot is not None:
+            for key, value in agent_snapshot.items():
+                try:
+                    setattr(current_agent, key, copy.deepcopy(value))
+                except Exception:
+                    pass
+        # A model switch may have restarted the slash worker. Recreate it with
+        # the restored model only when the session had one before the attempt.
+        if had_worker:
+            try:
+                _restart_slash_worker(sid, session)
+            except Exception:
+                pass
+        try:
+            def persist_restored_runtime() -> None:
+                _persist_live_session_runtime(session)
+                if current_agent is not None:
+                    _emit("session.info", sid, _session_info(current_agent, session))
+
+            if profile_home:
+                with _session_profile_runtime_scope(session):
+                    persist_restored_runtime()
+            else:
+                persist_restored_runtime()
+        except Exception:
+            pass
+
+    def config_set(key: str, value: str) -> dict:
+        setter = _methods.get("config.set")
+        if setter is None:
+            raise RuntimeError("config.set is unavailable")
+        call_params = dict(params)
+        call_params.update(
+            {
+                "session_id": sid,
+                "key": key,
+                "value": value,
+            }
+        )
+        if key == "model":
+            # A mode is already an explicit user selection; do not open a
+            # second cost/data-policy confirmation dialog in the desktop.
+            call_params["confirm_expensive_model"] = True
+        def invoke() -> dict:
+            return setter(f"{rid}:{key}", call_params)
+
+        if profile_home:
+            with _session_profile_runtime_scope(session):
+                response = invoke()
+        else:
+            response = invoke()
+        if not isinstance(response, dict) or "error" in response:
+            error = response.get("error") if isinstance(response, dict) else None
+            message = error.get("message") if isinstance(error, dict) else "setting failed"
+            raise RuntimeError(str(message))
+        result = response.get("result")
+        if not isinstance(result, dict):
+            return {}
+        if result.get("deferred"):
+            raise RuntimeError("setting was deferred while the session is changing")
+        return result
+
+    stage = "model"
+    try:
+        model_value = shlex.quote(preset.expected_model)
+        if preset.expected_provider:
+            model_value += f" --provider {shlex.quote(preset.expected_provider)}"
+        config_set("model", f"{model_value} --session")
+
+        stage = "reasoning"
+        config_set("reasoning", preset.reasoning)
+        stage = "Fast"
+        config_set("fast", "fast" if fast else "normal")
+
+        current_agent = session.get("agent")
+        model_override = session.get("model_override")
+        model_override = model_override if isinstance(model_override, dict) else {}
+        actual_model = str(
+            model_override.get("model")
+            or getattr(current_agent, "model", None)
+            or _resolve_model()
+            or ""
+        ).strip()
+        actual_provider = str(
+            model_override.get("provider")
+            or getattr(current_agent, "provider", None)
+            or ""
+        ).strip()
+        reasoning_config = session.get("create_reasoning_override")
+        if not isinstance(reasoning_config, dict) and current_agent is not None:
+            reasoning_config = getattr(current_agent, "reasoning_config", None)
+        if isinstance(reasoning_config, dict):
+            actual_reasoning = (
+                "none"
+                if reasoning_config.get("enabled") is False
+                else str(reasoning_config.get("effort") or "medium").strip().lower()
+            )
+        else:
+            actual_reasoning = "medium"
+        if "create_service_tier_override" in session:
+            actual_tier = session.get("create_service_tier_override") or None
+        elif current_agent is not None:
+            actual_tier = getattr(current_agent, "service_tier", None)
+        else:
+            actual_tier = _load_service_tier()
+        actual_fast = actual_tier == "priority"
+        verification = format_mode_verification(
+            expected_model=preset.expected_model,
+            expected_provider=preset.expected_provider,
+            expected_reasoning=preset.expected_reasoning,
+            expected_fast=fast,
+            actual_model=actual_model,
+            actual_provider=actual_provider,
+            actual_reasoning=actual_reasoning,
+            actual_fast=actual_fast,
+        )
+        if (
+            actual_model != preset.expected_model
+            or (
+                preset.expected_provider
+                and actual_provider != preset.expected_provider
+            )
+            or actual_reasoning != preset.expected_reasoning
+            or actual_fast != fast
+        ):
+            restore()
+            return _ok(
+                rid,
+                {
+                    "output": (
+                        f"❌ Mode `{mode_name}` verification failed; previous settings restored "
+                        f"({verification})."
+                    ),
+                    "mode": mode_name,
+                },
+            )
+    except Exception as exc:
+        restore()
+        return _ok(
+            rid,
+            {
+                "output": (
+                    f"❌ Mode `{mode_name}` failed while setting {stage}; "
+                    "previous settings restored."
+                ),
+                "mode": mode_name,
+                "error_type": type(exc).__name__,
+            },
+        )
+
+    if session.get("agent") is not None:
+        try:
+            _emit("session.info", sid, _session_info(session["agent"], session))
+        except Exception:
+            pass
+    return _ok(
+        rid,
+        {
+            "output": (
+                f"✅ Mode `{mode_name}` applied: `{preset.expected_model}` · "
+                f"Reasoning `{preset.expected_reasoning}` · Fast `{'on' if fast else 'off'}`"
+            ),
+            "mode": mode_name,
+        },
+    )
+
+
 @method("config.get")
 @_profile_scoped
 def _(rid, params: dict) -> dict:

@@ -3967,6 +3967,161 @@ class CLICommandsMixin:
         else:
             _cprint(f"  {_ACCENT}✓ Busy-indicator style set to '{arg}' (session only){_RST}")
 
+    def _handle_mode_command(self, cmd: str):
+        """Apply a configured model/reasoning preset in the CLI/slash worker.
+
+        The desktop has a live-session RPC for this operation, but older
+        gateways still fall back to the persistent slash worker. Keeping this
+        handler here makes ``/quick`` work in that fallback too, rather than
+        resolving the registry alias and then silently dropping into the
+        quick-command/skill branch.
+        """
+        import copy
+        import shlex
+
+        from cli import _ACCENT, _DIM, _RST, _cprint
+        from hermes_cli.config import load_config
+        from hermes_cli.mode_presets import (
+            available_mode_names,
+            format_mode_verification,
+            mode_command_fast_value,
+            resolve_mode_preset,
+        )
+
+        config = getattr(self, "config", None)
+        if not isinstance(config, dict) or not config.get("mode_presets"):
+            config = load_config() or {}
+
+        words = shlex.split(cmd.strip())
+        if not words:
+            _cprint(f"  {_DIM}Usage: /mode <name> [fast|normal]{_RST}")
+            return
+        command_name = words.pop(0).lstrip("/").lower()
+        if command_name == "mode":
+            if not words:
+                available = ", ".join(available_mode_names(config)) or "none configured"
+                _cprint(f"  {_DIM}Usage: /mode <name> [fast|normal]{_RST}")
+                _cprint(f"  {_DIM}Configured modes: {available}{_RST}")
+                return
+            mode_name = words.pop(0).lower()
+        else:
+            mode_name = command_name
+
+        preset = resolve_mode_preset(config, mode_name)
+        if preset is None:
+            available = ", ".join(available_mode_names(config)) or "none configured"
+            _cprint(f"  {_DIM}Unknown mode '{mode_name}'. Configured modes: {available}{_RST}")
+            return
+        if len(words) > 1 or (
+            words and words[0].lower() not in {"fast", "normal", "off"}
+        ):
+            _cprint(f"  {_DIM}Usage: /{mode_name} [fast|normal]{_RST}")
+            return
+        fast = mode_command_fast_value(preset, words[0] if words else None)
+
+        old_values = {
+            "model": getattr(self, "model", ""),
+            "provider": getattr(self, "provider", ""),
+            "requested_provider": getattr(self, "requested_provider", ""),
+            "reasoning_config": copy.deepcopy(getattr(self, "reasoning_config", None)),
+            "service_tier": getattr(self, "service_tier", None),
+            "agent": getattr(self, "agent", None),
+        }
+        old_agent_values = {}
+        old_agent = old_values["agent"]
+        if old_agent is not None:
+            for key in ("model", "provider", "base_url", "api_mode", "reasoning_config", "service_tier", "request_overrides"):
+                try:
+                    old_agent_values[key] = copy.deepcopy(getattr(old_agent, key, None))
+                except Exception:
+                    old_agent_values[key] = getattr(old_agent, key, None)
+
+        def restore() -> None:
+            for key, value in old_values.items():
+                setattr(self, key, value)
+            if old_agent is not None:
+                for key, value in old_agent_values.items():
+                    try:
+                        setattr(old_agent, key, copy.deepcopy(value))
+                    except Exception:
+                        pass
+
+        try:
+            model_command = f"/model {shlex.quote(preset.expected_model)} --session"
+            if preset.expected_provider:
+                model_command += f" --provider {shlex.quote(preset.expected_provider)}"
+            self._handle_model_switch(model_command)
+
+            if preset.reasoning in {"provider", "provider-managed", "provider_managed", "auto"}:
+                self.reasoning_config = None
+                self.agent = None
+            else:
+                self._handle_reasoning_command(f"/reasoning {preset.reasoning}")
+
+            if fast:
+                self._handle_fast_command("/fast fast")
+            else:
+                # Turning Fast off is valid even when the target model does
+                # not advertise Fast support. `/fast normal` historically
+                # rejected that case before it could clear a prior tier.
+                self.service_tier = None
+                self.agent = None
+
+            actual_model = str(
+                getattr(self, "model", "")
+                or getattr(getattr(self, "agent", None), "model", "")
+                or ""
+            ).strip()
+            actual_provider = str(
+                getattr(self, "provider", "")
+                or getattr(getattr(self, "agent", None), "provider", "")
+                or ""
+            ).strip()
+            actual_reasoning_config = getattr(self, "reasoning_config", None)
+            if not isinstance(actual_reasoning_config, dict):
+                actual_reasoning = "none" if preset.expected_reasoning == "none" else "medium"
+            else:
+                actual_reasoning = (
+                    "none"
+                    if actual_reasoning_config.get("enabled") is False
+                    else str(actual_reasoning_config.get("effort") or "medium").strip().lower()
+                )
+            actual_fast = getattr(self, "service_tier", None) == "priority"
+            verification = format_mode_verification(
+                expected_model=preset.expected_model,
+                expected_provider=preset.expected_provider,
+                expected_reasoning=preset.expected_reasoning,
+                expected_fast=fast,
+                actual_model=actual_model,
+                actual_provider=actual_provider,
+                actual_reasoning=actual_reasoning,
+                actual_fast=actual_fast,
+            )
+            if (
+                actual_model != preset.expected_model
+                or (preset.expected_provider and actual_provider != preset.expected_provider)
+                or actual_reasoning != preset.expected_reasoning
+                or actual_fast != fast
+            ):
+                restore()
+                _cprint(
+                    f"  {_DIM}❌ Mode '{mode_name}' verification failed; "
+                    f"previous settings restored ({verification}).{_RST}"
+                )
+                return
+        except Exception as exc:
+            restore()
+            _cprint(
+                f"  {_DIM}❌ Mode '{mode_name}' failed; previous settings restored "
+                f"({type(exc).__name__}).{_RST}"
+            )
+            return
+
+        _cprint(
+            f"  {_ACCENT}✅ Mode '{mode_name}' applied: {preset.expected_model} · "
+            f"Reasoning {preset.expected_reasoning} · Fast {'on' if fast else 'off'}{_RST}"
+        )
+
     def _handle_fast_command(self, cmd: str):
         """Handle /fast — toggle fast mode (OpenAI Priority Processing / Anthropic Fast Mode).
 

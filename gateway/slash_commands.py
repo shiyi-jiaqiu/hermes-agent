@@ -3973,11 +3973,22 @@ class GatewaySlashCommandsMixin:
         """Atomically apply a configured model/reasoning preset.
 
         ``/mode quick [fast]`` and the direct aliases ``/quick [fast]``,
-        ``/daily [fast]``, and ``/deep [fast]`` share this handler. Omitting
-        ``fast`` explicitly selects Normal mode, so any alias can also turn a
-        prior session-scoped Fast selection off.
+        ``/daily [fast]``, and ``/deep [fast]`` share this handler. When the
+        optional modifier is omitted, the preset's configured ``fast_mode``
+        value is used; ``fast``, ``normal``, and ``off`` override it.
         """
-        from gateway.run import _hermes_home, _load_gateway_config
+        from gateway.run import (
+            _hermes_home,
+            _load_gateway_config,
+            _resolve_gateway_model,
+        )
+        from hermes_cli.mode_presets import (
+            available_mode_names,
+            format_mode_verification,
+            mode_command_fast_value,
+            resolve_mode_preset,
+            resolve_model_reference,
+        )
 
         source = await asyncio.to_thread(
             self._normalize_source_for_session_key, event.source
@@ -3989,14 +4000,12 @@ class GatewaySlashCommandsMixin:
         cfg = _load_gateway_config(
             config_path=(profile_home or _hermes_home) / "config.yaml"
         ) or {}
-        raw_presets = cfg.get("mode_presets")
-        presets = dict(raw_presets) if isinstance(raw_presets, dict) else {}
 
         raw_command = str(event.get_command() or "").strip().lower()
         words = shlex.split(event.get_command_args().strip())
         if raw_command == "mode":
             if not words:
-                available = ", ".join(str(name) for name in presets) or "none configured"
+                available = ", ".join(available_mode_names(cfg)) or "none configured"
                 return (
                     "Usage: `/mode <name> [fast]`\n"
                     f"Configured modes: {available}"
@@ -4005,35 +4014,23 @@ class GatewaySlashCommandsMixin:
         else:
             mode_name = raw_command
 
-        fast = False
+        preset = resolve_mode_preset(cfg, mode_name)
+        if preset is None:
+            available = ", ".join(available_mode_names(cfg)) or "none configured"
+            return f"Unknown mode `{mode_name}`. Configured modes: {available}"
+
         if words:
             if len(words) != 1 or words[0].lower() not in {"fast", "normal", "off"}:
                 return f"Usage: `/{mode_name} [fast]`"
-            fast = words[0].lower() == "fast"
-
-        selected = presets.get(mode_name)
-        if not isinstance(selected, dict):
-            available = ", ".join(str(name) for name in presets) or "none configured"
-            return f"Unknown mode `{mode_name}`. Configured modes: {available}"
-        model_target = str(selected.get("model") or "").strip()
-        reasoning = str(selected.get("reasoning") or "").strip().lower()
-        if not model_target or not reasoning:
-            return f"Mode `{mode_name}` must configure both model and reasoning."
-
-        raw_aliases = cfg.get("model_aliases")
-        aliases = dict(raw_aliases) if isinstance(raw_aliases, dict) else {}
-        alias_spec = aliases.get(model_target)
-        if isinstance(alias_spec, dict):
-            expected_model = str(alias_spec.get("model") or model_target)
-        elif alias_spec:
-            expected_model = str(alias_spec)
+            fast = mode_command_fast_value(preset, words[0])
         else:
-            expected_model = model_target
-        expected_reasoning = (
-            "none"
-            if reasoning in {"provider", "provider-managed", "provider_managed", "auto"}
-            else reasoning
-        )
+            fast = mode_command_fast_value(preset)
+
+        model_target = preset.model_target
+        reasoning = preset.reasoning
+        expected_model = preset.expected_model
+        expected_provider = preset.expected_provider
+        expected_reasoning = preset.expected_reasoning
 
         model_snapshot = self._snapshot_session_model_override(session_key)
         state = self._peek_session_state(session_key)
@@ -4109,7 +4106,25 @@ class GatewaySlashCommandsMixin:
             actual_override = dict(
                 ((getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {})
             )
-            actual_model = str(actual_override.get("model") or "")
+            # A preset may already be the profile default. In that case
+            # _handle_model_command is allowed to leave the session override
+            # empty; verify the effective global model instead of treating the
+            # absent override as an empty model. This is especially important
+            # for Desktop/TUI sessions that lazily materialize overrides.
+            global_model, global_provider, _ = resolve_model_reference(
+                cfg, _resolve_gateway_model(cfg)
+            )
+            actual_model = str(
+                actual_override.get("model") or global_model or ""
+            ).strip()
+            actual_provider = str(
+                actual_override.get("provider")
+                or global_provider
+                or ((cfg.get("model") or {}).get("provider", "")
+                    if isinstance(cfg.get("model"), dict)
+                    else "")
+                or ""
+            ).strip()
             actual_reasoning = self._resolve_session_reasoning_config(
                 source=source,
                 session_key=session_key,
@@ -4118,19 +4133,31 @@ class GatewaySlashCommandsMixin:
             actual_reasoning_value = (
                 "none"
                 if not actual_reasoning or actual_reasoning.get("enabled") is False
-                else str(actual_reasoning.get("effort") or "medium")
+                else str(actual_reasoning.get("effort") or "medium").strip().lower()
             )
             actual_fast = self._resolve_session_service_tier(
                 session_key=session_key
             ) == "priority"
+            verification = format_mode_verification(
+                expected_model=expected_model,
+                expected_provider=expected_provider,
+                expected_reasoning=expected_reasoning,
+                expected_fast=fast,
+                actual_model=actual_model,
+                actual_provider=actual_provider,
+                actual_reasoning=actual_reasoning_value,
+                actual_fast=actual_fast,
+            )
             if (
                 actual_model != expected_model
+                or (expected_provider and actual_provider != expected_provider)
                 or actual_reasoning_value != expected_reasoning
                 or actual_fast != fast
             ):
                 await restore()
                 return (
-                    f"❌ Mode `{mode_name}` verification failed; previous settings restored."
+                    f"❌ Mode `{mode_name}` verification failed; previous settings restored "
+                    f"({verification})."
                 )
         except Exception:
             await restore()

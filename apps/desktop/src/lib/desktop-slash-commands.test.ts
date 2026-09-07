@@ -129,6 +129,25 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashSuggestion('/curator')).toBe(false)
   })
 
+  it('routes /quick to the live-session mode RPC instead of the slash worker', () => {
+    const surface = resolveDesktopCommand('/quick')?.surface
+
+    expect(surface?.kind).toBe('rpc')
+    expect(isDesktopSlashCommand('/quick')).toBe(true)
+    expect(desktopSlashCommandArgumentMode('/quick')).toBe('mixed')
+    expect(isDesktopSlashSuggestion('/quick')).toBe(false)
+
+    if (surface?.kind !== 'rpc') {
+      return
+    }
+
+    expect(surface.rpc).toBe('mode.apply')
+    expect(surface.buildParams({ arg: '', command: '/quick', name: 'quick', sessionId: 's-quick' })).toEqual({
+      session_id: 's-quick',
+      command: '/quick'
+    })
+  })
+
   it('/voice points at the composer voice button instead of the generic advanced message', () => {
     // /voice arms server-side capture — on the desktop the composer's own
     // voice conversation (mic menu / Ctrl+B) is the surface. A user typing

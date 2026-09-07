@@ -45,6 +45,28 @@ class HermesPanelControlService:
         path = self.runner._resolve_profile_home_for_source(source) / "config.yaml"
         return _load_gateway_config(config_path=path) or {}
 
+    def _canonical_session_key(self, source: Any, fallback: str) -> str:
+        """Use the runner's session namespace for panel reads and writes.
+
+        A panel stores the key that existed when its card was rendered. Desktop
+        reconnects and Telegram topic normalization can produce a newer
+        canonical key from the same source. If the two paths use different keys,
+        /mode mutates one session and the panel verifies the other, producing a
+        false rollback. Keep the persisted card key as a safe fallback for test
+        doubles and older runners.
+        """
+        try:
+            normalized = source
+            normalize = getattr(self.runner, "_normalize_source_for_session_key", None)
+            if normalize is not None:
+                normalized = normalize(source)
+            key = self.runner._session_key_for_source(normalized)
+            if isinstance(key, str) and key.strip():
+                return key
+        except Exception:
+            pass
+        return str(fallback or "")
+
     @staticmethod
     def _reasoning_value(config: Any) -> str:
         if not isinstance(config, dict):
@@ -251,6 +273,7 @@ class HermesPanelControlService:
         complete snapshot for direct non-Panel callers.
         """
         with self._scope(source):
+            session_key = self._canonical_session_key(source, session_key)
             cfg = self._config(source)
             raw_model_cfg = cfg.get("model")
             model_cfg: dict[str, Any] = (
@@ -517,6 +540,7 @@ class HermesPanelControlService:
     ) -> PanelControlResult:
         """Execute one allowlisted control using values resolved from state_data."""
         with self._scope(source):
+            session_key = self._canonical_session_key(source, session_key)
             if target == "snapshot":
                 return PanelControlResult(True, "状态已刷新")
             if target == "fast":
@@ -540,11 +564,40 @@ class HermesPanelControlService:
                 )
                 return PanelControlResult(not self._failed(result), result or "Fast 设置已更新")
             if target == "preset":
+                from gateway.run import _resolve_gateway_model
+                from hermes_cli.mode_presets import (
+                    available_mode_names,
+                    format_mode_verification,
+                    resolve_mode_preset,
+                    resolve_model_reference,
+                )
+
                 options = list(state_data.get("preset_options") or [])
                 if index is None or index >= len(options):
                     return PanelControlResult(False, "无效的预设索引")
                 selected = options[index]
-                name = str(selected.get("name") or "")
+                name = str(selected.get("name") or "").strip().lower()
+                try:
+                    preset_config = self._config(source)
+                except Exception:
+                    # Older/test runners may only expose the rendered panel
+                    # state. Production runners always provide _config(), but
+                    # retaining this fallback keeps a stale-card error atomic
+                    # instead of turning it into an unrelated AttributeError.
+                    preset_config = {
+                        "mode_presets": {
+                            name: {
+                                "model": selected.get("model"),
+                                "reasoning": selected.get("reasoning"),
+                                "fast_mode": selected.get("fast_mode", False),
+                            }
+                        }
+                    }
+                preset = resolve_mode_preset(preset_config, name)
+                if preset is None:
+                    available = ", ".join(available_mode_names(preset_config)) or "none configured"
+                    return PanelControlResult(False, f"预设 {name or '<empty>'} 不存在。可用预设：{available}")
+
                 model_snapshot = self.runner._snapshot_session_model_override(session_key)
                 state = self.runner._peek_session_state(session_key)
                 reasoning_snapshot = (
@@ -596,60 +649,66 @@ class HermesPanelControlService:
                     await restore_preset_snapshot()
                     return PanelControlResult(False, f"预设应用失败，已回滚：{result}")
 
-                desired_fast = bool(selected.get("fast_mode", False))
-                self.runner._set_session_service_tier_override(
-                    session_key,
-                    "priority" if desired_fast else None,
-                )
-                self.runner._evict_cached_agent(session_key)
-
-                # A slash handler returning success is not sufficient: confirm
-                # the effective session state before claiming an atomic preset
-                # application. This catches deferred/partial model switches and
-                # guarantees that the next rendered card cannot say "success"
-                # while still showing the previous model.
-                desired_model = str(selected.get("model") or "")
-                desired_reasoning = str(selected.get("reasoning") or "")
+                desired_model = preset.expected_model
+                desired_reasoning = preset.expected_reasoning
+                desired_fast = preset.fast_mode
+                # /mode may legitimately leave the model override empty when
+                # the selected model is already the profile default. Compare
+                # against the effective profile model in that case.
                 model_override = dict(
                     ((getattr(self.runner, "_session_model_overrides", {}) or {}).get(session_key) or {})
                 )
-                actual_model = str(model_override.get("model") or "")
+                global_model, global_provider, _ = resolve_model_reference(
+                    preset_config, _resolve_gateway_model(preset_config)
+                )
+                actual_model = str(
+                    model_override.get("model") or global_model or ""
+                ).strip()
+                actual_provider = str(
+                    model_override.get("provider")
+                    or global_provider
+                    or ((preset_config.get("model") or {}).get("provider", "")
+                        if isinstance(preset_config.get("model"), dict)
+                        else "")
+                    or ""
+                ).strip()
                 actual_reasoning = self._reasoning_value(
                     self.runner._resolve_session_reasoning_config(
                         source=source,
                         session_key=session_key,
                         model=actual_model,
                     )
-                )
+                ).strip().lower()
                 actual_fast = self.runner._resolve_session_service_tier(
                     session_key=session_key
                 ) == "priority"
-                expected_reasoning = (
-                    "none"
-                    if desired_reasoning.lower()
-                    in {"provider", "provider-managed", "provider_managed", "auto"}
-                    else desired_reasoning
+                verification = format_mode_verification(
+                    expected_model=desired_model,
+                    expected_provider=preset.expected_provider,
+                    expected_reasoning=desired_reasoning,
+                    expected_fast=desired_fast,
+                    actual_model=actual_model,
+                    actual_provider=actual_provider,
+                    actual_reasoning=actual_reasoning,
+                    actual_fast=actual_fast,
                 )
                 if (
                     actual_model != desired_model
-                    or actual_reasoning != expected_reasoning
+                    or (preset.expected_provider and actual_provider != preset.expected_provider)
+                    or actual_reasoning != desired_reasoning
                     or actual_fast != desired_fast
                 ):
                     await restore_preset_snapshot()
                     return PanelControlResult(
                         False,
-                        "预设结果校验失败，已回滚"
-                        f"（期望 {desired_model}/{expected_reasoning}/Fast "
-                        f"{'on' if desired_fast else 'off'}；实际 "
-                        f"{actual_model or 'unknown'}/{actual_reasoning}/Fast "
-                        f"{'on' if actual_fast else 'off'}）",
+                        f"预设结果校验失败，已回滚（{verification}）",
                     )
 
                 label = str(selected.get("label") or name)
                 return PanelControlResult(
                     True,
                     f"已应用 {label}：{desired_model} · Reasoning "
-                    f"{expected_reasoning} · Fast {'on' if desired_fast else 'off'}",
+                    f"{desired_reasoning} · Fast {'on' if desired_fast else 'off'}",
                 )
             if target == "model":
                 options = list(state_data.get("model_options") or [])

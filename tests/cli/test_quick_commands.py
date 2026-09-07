@@ -69,6 +69,50 @@ class TestCLIQuickCommands:
         printed = self._printed_plain(cli.console.print.call_args[0][0])
         assert printed == "overridden"
 
+    def test_quick_mode_alias_applies_the_panel_preset(self, capsys):
+        cli = self._make_cli({})
+        cli.config = {
+            "mode_presets": {
+                "fast": {"model": "flash-cpa", "reasoning": "high", "fast_mode": False}
+            },
+            "model_aliases": {
+                "flash-cpa": {"model": "target-model", "provider": "target-provider"}
+            },
+        }
+        cli.model = "old-model"
+        cli.provider = "old-provider"
+        cli.requested_provider = "old-provider"
+        cli.reasoning_config = {"enabled": True, "effort": "low"}
+        cli.service_tier = "priority"
+        cli.agent = None
+        cli._pending_resume_sessions = None
+        cli._handle_model_switch = MagicMock(
+            side_effect=lambda command: (
+                setattr(cli, "model", "target-model"),
+                setattr(cli, "provider", "target-provider"),
+                setattr(cli, "requested_provider", "target-provider"),
+            )
+        )
+        cli._handle_reasoning_command = MagicMock(
+            side_effect=lambda command: setattr(
+                cli, "reasoning_config", {"enabled": True, "effort": "high"}
+            )
+        )
+
+        assert cli.process_command("/quick") is True
+
+        cli._handle_model_switch.assert_called_once()
+        assert "target-model" in cli._handle_model_switch.call_args.args[0]
+        assert cli.reasoning_config["effort"] == "high"
+        assert cli.service_tier is None
+        printed = " ".join(
+            self._printed_plain(call.args[0])
+            for call in cli.console.print.call_args_list
+            if call.args
+        )
+        printed += capsys.readouterr().out
+        assert "Mode 'quick' applied" in printed
+
 
 
 
