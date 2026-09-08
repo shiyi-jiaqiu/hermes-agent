@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource
 
 
@@ -44,6 +44,7 @@ def _make_runner():
     # MagicMock's default truthy return would otherwise rehydrate a fake model
     # and make the session-scoped reasoning resolver receive a MagicMock.
     mock_store.get_model_override.return_value = None
+    mock_store.get_runtime_settings.return_value = None
     runner.session_store = mock_store
 
     from gateway.hooks import HookRegistry

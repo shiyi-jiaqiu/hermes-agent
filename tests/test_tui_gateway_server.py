@@ -14,6 +14,7 @@ import pytest
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli.active_sessions import active_session_registry_snapshot
+from hermes_cli.model_switch import ModelSwitchResult
 from hermes_cli.browser_connect import ChromeDebugLaunch
 from tools import async_delegation as ad
 from tui_gateway import server
@@ -4404,7 +4405,7 @@ def test_apply_model_switch_persist_override_false_never_persists(monkeypatch):
     # switch must not write config.yaml.
     import types as _types
 
-    result = _types.SimpleNamespace(
+    result = ModelSwitchResult(
         success=True,
         new_model="new/model",
         target_provider="nous",
@@ -4430,7 +4431,9 @@ def test_apply_model_switch_persist_override_false_never_persists(monkeypatch):
         "hermes_cli.model_cost_guard.expensive_model_warning",
         lambda *a, **k: None,
     )
-    session = {"agent": None}
+    session = _session()
+    session["agent"] = None
+    monkeypatch.setitem(server._sessions, "sid", session)
 
     out = server._apply_model_switch(
         "sid", session, "new/model --provider nous", persist_override=False
@@ -5294,27 +5297,62 @@ def test_finalize_session_closes_slash_worker(monkeypatch):
 
 
 def test_close_transport_rebinds_session_to_remaining_viewer(monkeypatch):
-    """Closing a pop-out window's transport must re-bind the session to a
-    still-open window instead of stranding it on the drop sentinel (#83716)."""
+    """Closing a pop-out window's transport must leave the session with the
+    still-open window instead of stranding it on the drop sentinel (#83716).
+
+    The rebind #83716 added is gone; multi-client fan-out subsumes it. Both
+    windows are attached to the slot at once, so the pop-out is a fan-out peer
+    rather than a viewer waiting to be promoted, and closing it detaches that
+    peer while retaining the surviving ordered mailbox. This pins the same
+    guarantee through the mechanism that replaced the rebind: the session is
+    not parked, not reaped, not handed to the orphan reaper, and the surviving
+    window keeps receiving frames.
+    """
     reap_calls = []
     monkeypatch.setattr(server, "_schedule_ws_orphan_reap", lambda sid: reap_calls.append(sid))
 
     class _LiveTransport:
-        def write(self, *a, **k):
+        def __init__(self):
+            self.frames = []
+            self.received = threading.Event()
+
+        def write(self, obj=None, *a, **k):
+            self.frames.append(obj)
+            self.received.set()
             return True
 
     main = _LiveTransport()
     popout = _LiveTransport()
-    session = _session(transport=popout, running=False)
+    session = _session(transport=None, running=False)
+    # Build the state the way production does: every window that resumes goes
+    # through _live_session_payload, which attaches it into the slot and then
+    # stamps it into the viewers registry.
+    server._attach_session_transport(session, main)
+    server._attach_session_transport(session, popout)
     session["viewers"] = {main: 100.0, popout: 200.0}
     server._sessions["multi-sid"] = session
+    assert isinstance(session["transport"], server.FanoutTransport)
 
-    reaped, detached = server._close_sessions_for_transport(popout)
+    try:
+        reaped, detached = server._close_sessions_for_transport(popout)
 
-    assert reaped == 0 and detached == 0
-    assert session["transport"] is main
-    assert "multi-sid" not in reap_calls
-    assert server._ws_session_is_orphaned(session) is False
+        assert reaped == 0 and detached == 0
+        assert server._session_transport_contains(session, main)
+        assert not server._session_transport_contains(session, popout)
+        assert "multi-sid" not in reap_calls
+        assert server._ws_session_is_orphaned(session) is False
+
+        # And it is still a working stream, not just a surviving reference.
+        server._emit("message.delta", "multi-sid", {"text": "still here"})
+        assert main.received.wait(timeout=5)
+        assert [(f.get("params") or {}).get("type") for f in main.frames] == [
+            "message.delta"
+        ]
+        assert popout.frames == []
+    finally:
+        # The fake slot must not outlive the test: _sessions is module state and
+        # later sweeps would walk it.
+        server._sessions.pop("multi-sid", None)
 
 
 def test_close_transport_detaches_when_no_viewers_remain(monkeypatch):
@@ -5340,7 +5378,15 @@ def test_close_transport_detaches_when_no_viewers_remain(monkeypatch):
 
 
 def test_close_transport_skips_dead_remaining_viewers(monkeypatch):
-    """A viewer whose socket is already dead must not win the re-bind."""
+    """A viewer whose socket is already dead must not hold the session open.
+
+    #83716's rebind refused to hand the session to a dead viewer; fan-out
+    membership keeps that filter through _transport_is_live_peer, which is what
+    decides whether anything survives the departing client. Both windows are
+    ATTACHED here, which is the state production builds — a viewer that was
+    never attached leaves the slot single-client and exercises the ordinary park
+    path instead of this one.
+    """
     reap_calls = []
     monkeypatch.setattr(server, "_schedule_ws_orphan_reap", lambda sid: reap_calls.append(sid))
 
@@ -5349,17 +5395,25 @@ def test_close_transport_skips_dead_remaining_viewers(monkeypatch):
             return True
 
     dead = _LiveTransport()
+    popout = _LiveTransport()
+    session = _session(transport=None, running=False)
+    server._attach_session_transport(session, dead)
+    server._attach_session_transport(session, popout)
+    session["viewers"] = {dead: 100.0, popout: 200.0}
+    assert isinstance(session["transport"], server.FanoutTransport)
+    # The socket goes away without a disconnect reaching the gateway; the latch
+    # _transport_is_dead reads is the only trace it leaves behind.
     dead._closed = True
-    owner = _LiveTransport()
-    session = _session(transport=owner, running=False)
-    session["viewers"] = {dead: 100.0, owner: 200.0}
     server._sessions["dead-viewer-sid"] = session
 
-    reaped, detached = server._close_sessions_for_transport(owner)
+    try:
+        reaped, detached = server._close_sessions_for_transport(popout)
 
-    assert detached == 1
-    assert session["transport"] is server._detached_ws_transport
-    assert reap_calls == ["dead-viewer-sid"]
+        assert reaped == 0 and detached == 1
+        assert session["transport"] is server._detached_ws_transport
+        assert reap_calls == ["dead-viewer-sid"]
+    finally:
+        server._sessions.pop("dead-viewer-sid", None)
 
 
 def test_live_session_payload_registers_transport_as_viewer():
@@ -5439,7 +5493,7 @@ def test_resume_rebind_cancels_pending_ws_orphan_reap(monkeypatch):
 
 
 def test_claim_or_reuse_live_winner_cancels_pending_reap(monkeypatch):
-    """A resume that reuses the live winner cancels the winner's pending reap."""
+    """The winner's pending reap is cancelled only once guarded reuse is accepted."""
     cancelled = []
 
     class _Timer:
@@ -5472,6 +5526,17 @@ def test_claim_or_reuse_live_winner_cancels_pending_reap(monkeypatch):
         )
 
         assert live == ("winner-sid", winner)
+        assert "winner-sid" in server._pending_ws_reaps
+        assert cancelled == []
+        assert winner["transport"] is server._detached_ws_transport
+
+        transport = object()
+        monkeypatch.setattr(server, "current_transport", lambda: transport)
+        ctx = server._Resume(1, {"omit_messages": True}, "stored-claim")
+        response = server._resume_reuse_live(ctx, *live)
+
+        assert response["result"]["session_id"] == "winner-sid"
+        assert winner["transport"] is transport
         assert "winner-sid" not in server._pending_ws_reaps
         assert len(cancelled) == 1
     finally:
@@ -7553,6 +7618,9 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         }
         for index in range(1, 4)
     ]
+    # Consecutive completions share one turn (#104671); a watch_match is a turn
+    # barrier, so it is the in-flight turn behind which batch_2/batch_3 must survive.
+    events[0].update(type="watch_match", pattern="owned-1")
     isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
     for event in events:
         isolated_queue.put(event)
@@ -8480,12 +8548,8 @@ def test_config_set_yolo_global_scope_honors_explicit_value(tmp_path, monkeypatc
     assert yaml.safe_load(cfg_path.read_text())["approvals"]["mode"] == "off"
 
 
-def test_config_set_fast_updates_live_agent_session_scoped(monkeypatch):
-    """A session-targeted fast toggle updates the live agent + pins the
-    per-session override, and NEVER writes global config — the desktop's
-    per-model presets call this on every model pick, and a global write
-    flipped the tier for every other session/profile (the "switch one
-    session, switches everywhere" class)."""
+def test_config_set_fast_defers_agent_rebuild_session_scoped(monkeypatch):
+    """Fast changes retire the agent and pin only this session's next build."""
     writes = []
     emits = []
     agent = types.SimpleNamespace(
@@ -8515,11 +8579,8 @@ def test_config_set_fast_updates_live_agent_session_scoped(monkeypatch):
             }
         )
         assert resp["result"]["value"] == "fast"
-        assert agent.service_tier == "priority"
-        assert agent.request_overrides == {
-            "foo": "bar",
-            "service_tier": "priority",
-        }
+        assert session["agent"] is None and session["lazy"]
+        assert session["model_override"]["request_overrides"] == agent.request_overrides
         assert session["create_service_tier_override"] == "priority"
         assert writes == []
         assert ("session.info", "sid", {"model": "x"}) in emits
@@ -8533,7 +8594,7 @@ def test_config_set_fast_updates_live_agent_session_scoped(monkeypatch):
         )
         assert resp_normal["result"]["value"] == "normal"
         assert agent.service_tier is None
-        assert agent.request_overrides == {"foo": "bar"}
+        assert session["agent"] is None
         # "" (not absent) so a rebuild pins normal instead of falling back to
         # the global default.
         assert session["create_service_tier_override"] == ""
@@ -8624,7 +8685,7 @@ def test_config_set_fast_rejects_missing_model(monkeypatch):
             }
         )
         assert resp["error"]["code"] == 4002
-        assert "without a selected model" in resp["error"]["message"]
+        assert "not available for the selected model" in resp["error"]["message"]
         assert agent.service_tier is None
         assert agent.request_overrides == {}
         assert writes == []
@@ -9244,7 +9305,7 @@ def test_complete_slash_leaves_argument_stages_alone(monkeypatch):
     assert [item["text"] for item in items] == ["collapsed", "cycle"]
 
 
-def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypatch):
+def test_config_set_reasoning_updates_session_and_defers_agent(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
     (tmp_path / "config.yaml").write_text("agent:\n  reasoning_effort: medium\n", encoding="utf-8")
     agent = types.SimpleNamespace(reasoning_config=None)
@@ -9262,7 +9323,7 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
         }
     )
     assert resp_effort["result"]["value"] == "low"
-    assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+    assert server._sessions["sid"]["agent"] is None
     assert server._sessions["sid"]["create_reasoning_override"] == {"enabled": True, "effort": "low"}
     assert server._load_cfg()["agent"]["reasoning_effort"] == "medium"
 
@@ -9282,6 +9343,7 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
 
     del server._sessions["sid"]["create_reasoning_override"]
     agent.reasoning_config = {"enabled": True, "effort": "high"}
+    server._sessions["sid"]["agent"] = agent
     resp_agent_status = server.handle_request(
         {
             "id": "7",
@@ -9363,7 +9425,7 @@ def test_config_set_reasoning_global_scope_clears_session_override(tmp_path, mon
 
     assert resp["result"]["value"] == "high"
     assert server._load_cfg()["agent"]["reasoning_effort"] == "high"
-    assert "create_reasoning_override" not in server._sessions["sid"]
+    assert server._sessions["sid"].get("create_reasoning_override") is None
 
     status = server.handle_request(
         {"id": "2", "method": "config.get", "params": {"session_id": "sid", "key": "reasoning"}}
@@ -9390,10 +9452,8 @@ def test_config_set_verbose_updates_session_mode_and_agent(tmp_path, monkeypatch
 
 
 
-def test_config_set_model_waits_for_lazy_agent_before_switch(monkeypatch):
-    """A model switch against a lazy-created live session must apply to the
-    real agent, not just process env, before the prompt is dispatched.
-    """
+def test_config_set_model_defers_lazy_agent_until_next_turn(monkeypatch):
+    """A lazy session can save the new route without building the old model."""
 
     agent_ready = threading.Event()
     agent = types.SimpleNamespace(model="old/model", provider="old-provider")
@@ -9410,8 +9470,7 @@ def test_config_set_model_waits_for_lazy_agent_before_switch(monkeypatch):
 
     def fake_apply(sid, target, raw, **kwargs):
         calls.append(("apply", sid, target.get("agent"), raw))
-        if target.get("agent") is not agent:
-            raise AssertionError("model switch ran before lazy agent was ready")
+        assert target.get("agent") is None
         return {"value": "new/model", "warning": ""}
 
     monkeypatch.setattr(server, "_start_agent_build", fake_start)
@@ -9426,8 +9485,9 @@ def test_config_set_model_waits_for_lazy_agent_before_switch(monkeypatch):
             }
         )
 
+        assert "result" in resp, resp
         assert resp["result"]["value"] == "new/model"
-        assert calls == [("start", "sid"), ("apply", "sid", agent, "new/model")]
+        assert calls == [("apply", "sid", None, "new/model")]
     finally:
         server._sessions.pop("sid", None)
 
@@ -9448,7 +9508,9 @@ def test_config_set_model_uses_live_switch_path(monkeypatch):
         }
     )
 
+    assert "result" in resp, resp
     assert resp["result"]["value"] == "new/model"
+    assert "result" in resp, resp
     assert resp["result"]["warning"] == "catalog unreachable"
     assert seen["args"] == ("sid", "session-key", "new/model")
 
@@ -9464,7 +9526,7 @@ def test_config_set_model_requires_confirmation_for_expensive_model(monkeypatch)
         def switch_model(self, **_kwargs):
             self.switched = True
 
-    result = types.SimpleNamespace(
+    result = ModelSwitchResult(
         success=True,
         new_model="openai/gpt-5.5-pro",
         target_provider="openrouter",
@@ -9499,6 +9561,7 @@ def test_config_set_model_requires_confirmation_for_expensive_model(monkeypatch)
         }
     )
 
+    assert "result" in resp, resp
     assert resp["result"]["confirm_required"] is True
     assert "did you mean to select openai/gpt-5.5?" in resp["result"]["confirm_message"]
     assert agent.switched is False
@@ -9518,7 +9581,8 @@ def test_config_set_model_requires_confirmation_for_expensive_model(monkeypatch)
 
     assert confirmed["result"]["confirm_required"] is False
     assert confirmed["result"]["value"] == "openai/gpt-5.5-pro"
-    assert agent.switched is True
+    assert server._sessions["sid"]["agent"] is None
+    assert server._sessions["sid"]["model_override"]["model"] == "openai/gpt-5.5-pro"
 
 
 def test_config_set_model_global_persists(monkeypatch):
@@ -9531,7 +9595,7 @@ def test_config_set_model_global_persists(monkeypatch):
         def switch_model(self, **kwargs):
             return None
 
-    result = types.SimpleNamespace(
+    result = ModelSwitchResult(
         success=True,
         new_model="anthropic/claude-sonnet-4.6",
         target_provider="anthropic",
@@ -9567,6 +9631,7 @@ def test_config_set_model_global_persists(monkeypatch):
         }
     )
 
+    assert "result" in resp, resp
     assert resp["result"]["value"] == "anthropic/claude-sonnet-4.6"
     assert seen["is_global"] is True
     assert saved_values["model.default"] == "anthropic/claude-sonnet-4.6"
@@ -9612,6 +9677,7 @@ def test_config_set_model_explicit_provider_skips_broken_default_init(monkeypatc
             }
         )
 
+        assert "result" in resp, resp
         assert resp["result"]["value"] == "claude-sonnet-4-6"
         assert seen["build"] == 0
         assert seen["wait"] == 0
@@ -9726,7 +9792,7 @@ def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
             "current_api_key": kwargs["current_api_key"],
         }
         switch_called.set()
-        return types.SimpleNamespace(
+        return ModelSwitchResult(
             success=True,
             new_model="new/model",
             target_provider="custom:new-provider",
@@ -9745,14 +9811,11 @@ def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
         def get_session(self, _key):
             return {"model_config": {}}
 
-        def update_session_meta(self, key, model_config, model):
-            seen["persisted"].append(
-                {
-                    "key": key,
-                    "model": model,
-                    "config": json.loads(model_config),
-                }
-            )
+        def ensure_session(self, key, **kwargs):
+            pass
+
+        def update_runtime_settings(self, key, settings):
+            seen["persisted"].append({"key": key, "config": settings})
 
         def close(self):
             pass
@@ -9843,6 +9906,7 @@ def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
 
         assert not request_thread.is_alive()
         assert "error" not in response
+        assert "result" in response["value"], response
         assert response["value"]["result"]["value"] == "new/model"
         assert make_calls == 2
         assert seen["switch"] == {
@@ -9862,24 +9926,19 @@ def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
         overrides = seen["build"]["overrides"]
         assert overrides["model_override"] == session["model_override"]
         assert overrides["provider_override"] == "custom:new-provider"
-        assert overrides["reasoning_config_override"] == reasoning
+        assert overrides["reasoning_config_override"] == {"enabled": True, **reasoning}
         assert session["agent_error"] is None
         assert session["agent"].model == "new/model"
         assert session["agent"].base_url == profile_url
         assert session["agent"].api_key == "profile-secret"
-        assert seen["persisted"] == [
-            {
-                "key": "session-key",
-                "model": "new/model",
-                "config": {
-                    "model": "new/model",
-                    "provider": "custom:new-provider",
-                    "base_url": profile_url,
-                    "api_mode": "chat_completions",
-                    "reasoning_config": reasoning,
-                },
-            }
-        ]
+        assert len(seen["persisted"]) == 1
+        persisted = seen["persisted"][0]
+        assert persisted["key"] == "session-key"
+        assert persisted["config"]["model"] == "new/model"
+        assert persisted["config"]["provider"] == "custom:new-provider"
+        assert persisted["config"]["base_url"] == profile_url
+        assert persisted["config"]["reasoning"] == "high"
+        assert persisted["config"]["reasoning_inherited"] is False
     finally:
         release_old_finally.set()
         old_ready.set()
@@ -9952,7 +10011,7 @@ def test_config_set_model_does_not_leak_inference_provider_env(monkeypatch):
         def switch_model(self, **_kwargs):
             return None
 
-    result = types.SimpleNamespace(
+    result = ModelSwitchResult(
         success=True,
         new_model="claude-sonnet-4.6",
         target_provider="anthropic",
@@ -10012,7 +10071,7 @@ def test_config_set_model_records_per_session_override_not_env(monkeypatch):
         def switch_model(self, **_kwargs):
             return None
 
-    result = types.SimpleNamespace(
+    result = ModelSwitchResult(
         success=True,
         new_model="deepseek-v4-pro",
         target_provider="custom:xuanji",
@@ -10060,13 +10119,10 @@ def test_config_set_model_records_per_session_override_not_env(monkeypatch):
         server._sessions.clear()
 
 
-def test_config_set_model_switches_agent_without_touching_env(monkeypatch):
-    """A /model switch mutates the target session's agent in place and records
-    a per-session override; it does NOT write HERMES_MODEL / HERMES_TUI_PROVIDER
-    etc. into the shared process environment.
-
-    (Was test_config_set_model_syncs_tui_provider_env.)
-    """
+def test_config_set_model_switches_agent_without_touching_env(monkeypatch, tmp_path):
+    """Persist a session route and invalidate its prompt without changing env."""
+    from contextlib import contextmanager
+    from hermes_state import SessionDB
 
     class Agent:
         model = "gpt-5.3-codex"
@@ -10083,28 +10139,17 @@ def test_config_set_model_switches_agent_without_touching_env(monkeypatch):
         def _build_system_prompt(self, _system_message=None):
             return f"Model: {self.model}\nProvider: {self.provider}"
 
-    class SessionDB:
-        def __init__(self):
-            self.model_config = None
-            self.system_prompt = None
-            self.messages = []
-
-        def get_session(self, _session_id):
-            return {"model_config": self.model_config}
-
-        def update_session_meta(self, _session_id, model_config_json, _model=None):
-            self.model_config = model_config_json
-
-        def update_system_prompt(self, _session_id, system_prompt):
-            self.system_prompt = system_prompt
-
-        def append_message(self, session_id, role, content=None, **_kwargs):
-            self.messages.append(
-                {"session_id": session_id, "role": role, "content": content}
-            )
-
     agent = Agent()
-    db = SessionDB()
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.ensure_session("session-key", source="tui", model=agent.model)
+    db.update_system_prompt("session-key", agent._cached_system_prompt)
+    agent.release_clients = Mock()
+
+    @contextmanager
+    def database(_session):
+        yield db
+
+    monkeypatch.setattr(server, "_session_db", database)
     agent._session_db = db
     session = _session(agent=agent)
     server._sessions["sid"] = session
@@ -10115,7 +10160,7 @@ def test_config_set_model_switches_agent_without_touching_env(monkeypatch):
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
 
     def fake_switch_model(**kwargs):
-        return types.SimpleNamespace(
+        return ModelSwitchResult(
             success=True,
             new_model="anthropic/claude-sonnet-4.6",
             target_provider="anthropic",
@@ -10140,34 +10185,21 @@ def test_config_set_model_switches_agent_without_touching_env(monkeypatch):
             }
         )
 
+        assert "result" in resp, resp
         assert resp["result"]["value"] == "anthropic/claude-sonnet-4.6"
-        # Agent switched in place...
-        assert agent.model == "anthropic/claude-sonnet-4.6"
-        assert agent.provider == "anthropic"
-        # ...override recorded on the session...
+        assert session["agent"] is None and session["lazy"]
+        agent.release_clients.assert_called_once()
         assert session["model_override"]["model"] == "anthropic/claude-sonnet-4.6"
         assert session["model_override"]["provider"] == "anthropic"
-        # ...the persisted prompt snapshot tracks the new runtime identity too.
-        # Without this, the next turn restored the old system prompt from the DB:
-        # API calls went to the new model, but "what model are you?" still read
-        # "Model: old/model" from the stored prompt.
-        assert db.system_prompt == (
-            "Model: anthropic/claude-sonnet-4.6\nProvider: anthropic"
-        )
-        assert agent._cached_system_prompt == db.system_prompt
-        assert session["history"][-1]["role"] == "user"
-        assert "changed to anthropic/claude-sonnet-4.6" in session["history"][-1]["content"]
-        assert db.messages[-1] == {
-            "session_id": "session-key",
-            "role": "user",
-            "content": session["history"][-1]["content"],
-        }
+        assert db.get_runtime_settings("session-key")["model"] == "anthropic/claude-sonnet-4.6"
+        assert db.get_session("session-key")["system_prompt"] is None
         # ...and the shared process env was NOT touched.
         assert os.environ["HERMES_TUI_PROVIDER"] == "openai-codex"
         assert "HERMES_MODEL" not in os.environ
         assert "HERMES_INFERENCE_MODEL" not in os.environ
     finally:
         server._sessions.clear()
+        db.close()
 
 
 def test_config_set_model_once_keeps_env_and_records_restore(monkeypatch):
@@ -10185,7 +10217,7 @@ def test_config_set_model_once_keeps_env_and_records_restore(monkeypatch):
             self.base_url = kwargs["base_url"]
             self.api_mode = kwargs["api_mode"]
 
-    result = types.SimpleNamespace(
+    result = ModelSwitchResult(
         success=True,
         new_model="claude-sonnet-4.6",
         target_provider="anthropic",
@@ -10220,6 +10252,7 @@ def test_config_set_model_once_keeps_env_and_records_restore(monkeypatch):
             }
         )
 
+        assert "result" in resp, resp
         assert resp["result"]["scope"] == "once"
         assert seen["is_global"] is False
         assert agent.model == "claude-sonnet-4.6"
@@ -10266,7 +10299,7 @@ def test_config_set_model_session_switch_clears_pending_once_restore(monkeypatch
             self.base_url = kwargs["base_url"]
             self.api_mode = kwargs["api_mode"]
 
-    result = types.SimpleNamespace(
+    result = ModelSwitchResult(
         success=True,
         new_model="new/model",
         target_provider="openrouter",
@@ -10857,7 +10890,7 @@ def test_slash_exec_r7_read_commands_use_metadata_mirror_flag_on(monkeypatch):
         "history": "live question from state db",
         "prompt": "host system prompt",
         "status": "Tokens: 140",
-        "context": "Context usage: ~80 / 1,000 tokens",
+        "context": "Context usage: 80 / 1,000 tokens",
         "tools": "terminal",
         "help": "/status",
     }
@@ -10875,6 +10908,16 @@ def test_slash_exec_r7_read_commands_use_metadata_mirror_flag_on(monkeypatch):
             assert expected in resp["result"]["output"]
             assert "stale parent mirror" not in resp["result"]["output"]
             assert "(._.)" not in resp["result"]["output"]
+        mirrored_usage = server._sessions["sid"]["_metadata_mirror"]["usage"]
+        for estimated in (True, False):
+            mirrored_usage["context_estimated"] = estimated
+            mirrored_usage["context_source"] = "local_estimate" if estimated else "provider_usage"
+            response = server.handle_request({
+                "id": "context-provenance", "method": "slash.exec",
+                "params": {"command": "context", "session_id": "sid"},
+            })
+            mark = "~" if estimated else ""
+            assert f"Context usage: {mark}80 / 1,000 tokens ({mark}8.0%)" in response["result"]["output"]
     finally:
         server._sessions.pop("sid", None)
 
@@ -15440,6 +15483,7 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
     """session.branch must copy history into the parent's profile state.db."""
     profile_home = tmp_path / "profiles" / "mlperf"
     profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     seen: dict = {"msgs": []}
 
     class LaunchDB:
@@ -15878,6 +15922,7 @@ def test_session_branch_installs_parent_profile_secret_scope(monkeypatch, tmp_pa
 
     profile_home = tmp_path / "profiles" / "mlperf"
     profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (profile_home / ".env").write_text(
         "PROXMOX_TOKEN=mlperf-secret\n", encoding="utf-8"
     )
@@ -15970,6 +16015,7 @@ def test_session_branch_uses_persisted_display_history_after_compaction(monkeypa
     """A live branch must copy the complete visible transcript, not the compacted model tail."""
     profile_home = tmp_path / "profiles" / "mlperf"
     profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     seen: dict = {"msgs": []}
 
     display_history = [
@@ -19712,7 +19758,7 @@ def test_persist_model_switch_preserves_sibling_model_keys(tmp_path, monkeypatch
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(cli, "_hermes_home", tmp_path)
 
-    result = types.SimpleNamespace(
+    result = ModelSwitchResult(success=True,
         new_model="new-model", target_provider="anthropic", base_url=None
     )
     server._persist_model_switch(result)
@@ -19746,7 +19792,7 @@ def test_persist_model_switch_clears_stale_base_url(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_hermes_home", tmp_path)
 
     # Switch to a native provider with no base_url.
-    result = types.SimpleNamespace(
+    result = ModelSwitchResult(success=True,
         new_model="claude-haiku", target_provider="anthropic", base_url=None
     )
     server._persist_model_switch(result)
@@ -20652,7 +20698,7 @@ def test_prompt_submit_passes_persist_user_message_to_agent(monkeypatch):
         server._sessions.pop("sid", None)
 
 
-def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
+def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_path):
     """The trim boundary must not retain the just-pruned history snapshots."""
     observed = {}
     cleanup_order = []
@@ -20691,7 +20737,10 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
         observed["run_kwargs"] = caller_locals.get("run_kwargs")
 
     session = _session(agent=_Agent())
-    session["profile_home"] = "/tmp/test-profile"
+    profile_home = tmp_path / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    session["profile_home"] = str(profile_home)
     session["history"] = [
         {"role": "tool", "tool_call_id": "old", "content": "x" * 20_000}
     ]

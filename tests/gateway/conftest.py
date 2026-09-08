@@ -66,6 +66,18 @@ def _bind_lark_sdk_globals_when_installed():
     yield
 
 
+def make_settings_session_store(session_id="settings-test"):
+    """SessionStore boundary for command tests that do not exercise SQLite."""
+    from types import SimpleNamespace
+    store = MagicMock()
+    store._entries = {}
+    store.get_or_create_session.return_value = SimpleNamespace(session_id=session_id)
+    store.get_runtime_settings.return_value = None
+    store.get_model_override.return_value = None
+    store.matches_session.side_effect = lambda key, sid: sid == session_id
+    return store
+
+
 def make_async_session_db(sync_mock=None):
     """Wrap a sync mock SessionDB in AsyncSessionDB so gateway code that awaits
     the facade works in tests. Returns (facade, sync_mock); configure return

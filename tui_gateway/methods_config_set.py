@@ -116,6 +116,11 @@ def _set_model(rid, params, key, value, session):
     sid = params.get("session_id", "")
     if session and session.get("running"):
         return _stash_pending_model_switch(rid, key, value, session, confirmed, flags)
+    recovering = bool(session and session.get("agent") is None and session.get("agent_error") is not None)
+    if session and session.get("agent_build_started"):
+        ready = session.get("agent_ready")
+        if ready is not None and not ready.wait(timeout=30.0):
+            return _err(rid, 5032, "agent initialization timed out")
     if session and flags.is_once:
         _start_agent_build(sid, session)
         if error := _cfgset_await_agent(session, rid):
@@ -123,7 +128,12 @@ def _set_model(rid, params, key, value, session):
     with _session_profile_runtime_scope(session or {}):
         result = _apply_model_switch(sid, session if session is not None else {"agent": None}, value,
                                      confirm_expensive_model=confirmed, parsed_flags=flags,
-                                     persist_override=True if session is None else None)
+                                     persist_override=True if session is None else None,
+                                     pin_session_override=session is not None)
+    if recovering and not result.get("confirm_required"):
+        _start_agent_build(sid, session)
+        if error := _cfgset_await_agent(session, rid):
+            return error
     return _kv(rid, key, result["value"], warning=result["warning"],
                confirm_required=result.get("confirm_required", False),
                confirm_message=result.get("confirm_message", ""), scope=result.get("scope", "session"),

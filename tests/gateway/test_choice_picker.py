@@ -15,7 +15,8 @@ import yaml
 
 import gateway.run as gateway_run
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent, SendResult
+from gateway.platforms.base import SendResult
+from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource
 
 
@@ -65,7 +66,18 @@ def _make_runner(adapter=None):
     runner._adapter_for_source = lambda source: adapter
     runner._thread_metadata_for_source = lambda source, anchor=None: {}
     runner._reply_anchor_for_event = lambda event: None
+    from gateway.config import GatewayConfig
+    from tests.gateway.conftest import make_settings_session_store
+    runner.config = GatewayConfig()
+    runner.session_store = make_settings_session_store()
     return runner
+
+
+@pytest.fixture(autouse=True)
+def runtime_credentials(monkeypatch):
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **kwargs: {
+        "model": kwargs.get("target_model") or "gpt-5.6", "provider": "openai-codex",
+        "api_key": "test-key", "base_url": "https://chatgpt.com/backend-api/codex", "api_mode": "codex_responses"})
 
 
 class TestReasoningChoicePicker:
@@ -111,7 +123,7 @@ class TestReasoningChoicePicker:
 class TestFastChoicePicker:
     def _patch_fast_support(self, monkeypatch, tmp_path):
         monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda **kwargs: {"model": {"default": "gpt-5.6", "provider": "openai-codex"}})
         monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda cfg: "gpt-5.6")
         import hermes_cli.models as models_mod
         monkeypatch.setattr(models_mod, "model_supports_fast_mode", lambda m: True)
@@ -140,7 +152,7 @@ class TestFastChoicePicker:
         on_choice = adapter.calls[0]["on_choice_selected"]
         await on_choice(event.source.chat_id, "fast")
 
-        assert runner._service_tier == "priority"
+        assert runner._service_tier is None
         assert runner._session_service_tier_overrides
         assert not (tmp_path / "config.yaml").exists()
 

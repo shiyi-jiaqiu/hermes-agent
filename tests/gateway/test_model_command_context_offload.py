@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import gateway.slash_commands as slash_commands
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 
 
@@ -84,11 +84,10 @@ def _runner_with_store(tmp_path, monkeypatch):
     runner._session_model_overrides = {}
     runner._pending_one_turn_model_restores = {}
     runner._running_agents = {}
-    _store = MagicMock()
-    _store.set_model_override = AsyncMock()
-    _store._store = None
-    runner.session_store = None
-    runner._async_session_store = _store
+    from gateway.config import GatewayConfig
+    from tests.gateway.conftest import make_settings_session_store
+    runner.config = GatewayConfig()
+    runner.session_store = make_settings_session_store()
     return runner
 
 

@@ -3,7 +3,7 @@
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
@@ -18,7 +18,10 @@ def _make_runner():
     runner._agent_cache_lock = None
     runner._session_db = None
     runner._evict_cached_agent = lambda _session_key: None
-    runner.session_store = None
+    from gateway.config import GatewayConfig
+    from tests.gateway.conftest import make_settings_session_store
+    runner.config = GatewayConfig()
+    runner.session_store = make_settings_session_store()
     return runner
 
 

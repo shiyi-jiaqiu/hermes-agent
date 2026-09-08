@@ -14,7 +14,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.event import MessageEvent, MessageType
 from plugins.platforms.telegram.adapter import TelegramAdapter
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
@@ -112,6 +113,8 @@ def _run_agent_runner(adapter):
     runner._provider_routing = {}
     runner._fallback_model = None
     runner._session_db = None
+    from tests.gateway.conftest import make_settings_session_store
+    runner.session_store = make_settings_session_store()
     runner._running_agents = {}
     runner._session_run_generation = {}
     runner._queued_events = {}

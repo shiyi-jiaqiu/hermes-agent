@@ -19,7 +19,7 @@ import pytest
 import yaml
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
@@ -30,6 +30,10 @@ def _make_runner():
     runner._voice_mode = {}
     runner._session_model_overrides = {}
     runner._running_agents = {}
+    from gateway.config import GatewayConfig
+    from tests.gateway.conftest import make_settings_session_store
+    runner.config = GatewayConfig()
+    runner.session_store = make_settings_session_store()
     return runner
 
 
@@ -119,33 +123,15 @@ async def test_typed_model_expensive_confirm_once_applies_switch(tmp_path, monke
 
 
 @pytest.mark.asyncio
-async def test_failed_inplace_swap_aborts_commit(tmp_path, monkeypatch):
-    """A failed in-place agent swap must be a no-op, not a dead session.
-
-    Regression for #50163: the resolution pipeline succeeds (valid model name)
-    but the cached agent's ``switch_model()`` raises mid-conversation (bad key /
-    unreachable URL). The agent rolls itself back to the old working model; the
-    gateway must NOT then commit the broken model as a session override or evict
-    the working cached agent — otherwise the next message rebuilds a dead agent
-    and the conversation is lost.
-    """
+async def test_failed_settings_persistence_preserves_cached_agent(tmp_path, monkeypatch):
+    """A failed settings commit preserves the working cached agent and route."""
     _setup_isolated_home(tmp_path, monkeypatch, warn=False)
     runner = _make_runner()
 
-    # Working cached agent whose in-place swap fails (and rolls itself back).
-    class _FailingAgent:
-        def __init__(self):
-            self.model = "old-model"
-            self.provider = "openrouter"
-
-        def switch_model(self, **kwargs):
-            # Mirrors agent_runtime_helpers.switch_model: the real method
-            # restores old state then re-raises. We keep model unchanged.
-            raise RuntimeError("connection refused: bad base_url")
-
     import threading
 
-    agent = _FailingAgent()
+    agent = SimpleNamespace(model="old-model", provider="openrouter")
+    runner.session_store.set_runtime_settings.side_effect = RuntimeError("database write failed")
     runner._agent_cache = {}
     runner._agent_cache_lock = threading.Lock()
     session_key = runner._session_key_for_source(_make_event("/model x").source)

@@ -25,7 +25,7 @@ import yaml
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
@@ -53,6 +53,10 @@ def _make_runner(adapter):
     runner._voice_mode = {}
     runner._session_model_overrides = {}
     runner._running_agents = {}
+    from gateway.config import GatewayConfig
+    from tests.gateway.conftest import make_settings_session_store
+    runner.config = GatewayConfig()
+    runner.session_store = make_settings_session_store()
     return runner
 
 
@@ -195,9 +199,9 @@ async def test_picker_tap_global_flag_persists(tmp_path, monkeypatch, seed_model
     )
     assert written["model"]["default"] == "gpt-5.5"
     assert written["model"]["provider"] == "openrouter"
-    assert "base_url" not in written["model"]
+    assert written["model"]["base_url"] == "https://openrouter.ai/api/v1"
     assert "api_key" not in written["model"]
-    assert "api_mode" not in written["model"]
+    assert written["model"]["api_mode"] == "chat_completions"
     assert "context_length" not in written["model"]
 
 

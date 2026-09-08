@@ -25,11 +25,13 @@ class _TUISettingsEndpoint:
             route = {"model": route}
         def field(name, default=""):
             return route.get(name, getattr(agent, name, default)) or ""
-        rc = session.get("create_reasoning_override")
+        resume = session.get("resume_runtime_overrides") or {}
+        rc = session.get("create_reasoning_override", resume.get("reasoning_config_override"))
+        reasoning_inherited = rc is None
         if rc is None:
             from hermes_constants import resolve_reasoning_config
             rc = resolve_reasoning_config(cfg, field("model", model_cfg.get("default", "")))
-        tier = session.get("create_service_tier_override")
+        tier = session.get("create_service_tier_override", resume.get("service_tier_override"))
         if tier is None:
             tier = getattr(agent, "service_tier", _load_service_tier())
         return RuntimeSettings(field("model", model_cfg.get("default", "")),
@@ -37,8 +39,9 @@ class _TUISettingsEndpoint:
                                field("base_url", model_cfg.get("base_url", "")),
                                field("api_mode", model_cfg.get("api_mode", "")),
                                reasoning_name(rc), tier or "normal", field("api_key"),
-                               route.get("request_overrides"), route.get("capabilities"),
-                               session.get("create_reasoning_override") is None,
+                               route.get("request_overrides", getattr(agent, "request_overrides", None)),
+                               route.get("capabilities", getattr(agent, "capabilities", None)),
+                               reasoning_inherited,
                                runtime_resolved=bool(agent or route),
                                temporary=session.get("one_turn_model_restore") is not None)
 

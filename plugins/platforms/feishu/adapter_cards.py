@@ -8,7 +8,8 @@ import time
 from datetime import datetime
 from types import SimpleNamespace
 
-from gateway.platforms.base import MessageEvent, MessageType, SendResult
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.base import SendResult
 
 logger = logging.getLogger(__name__)
 

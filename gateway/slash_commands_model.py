@@ -15,7 +15,7 @@ import logging
 from typing import Any, Optional
 
 from agent.i18n import t
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.event import MessageEvent
 from hermes_cli.config import atomic_config_write, clear_model_endpoint_credentials
 from utils import base_url_host_matches
 
@@ -58,8 +58,8 @@ async def _persist_model_switch_to_config(result, config_path) -> None:
     """Write-through a resolved /model switch to ``config_path`` (model.default/provider/base_url).
 
     Raw read: merged defaults must not be persisted back. A scalar/None ``model:`` is coerced to a
-    dict first. Named providers re-resolve base_url/api_mode, so leftovers are cleared; custom
-    providers have no registry entry to re-derive from and need an explicit set-or-clear.
+    dict first. Persist the resolved base_url/api_mode for every provider so the
+    next process reconstructs the same route, clearing values absent from that route.
     """
     from hermes_cli.config import read_user_config_raw, atomic_config_write
 
@@ -343,7 +343,7 @@ class GatewayModelCommandsMixin:
         model_cfg: dict = {}
         config_ctx = None
         with contextlib.suppress(Exception):  # fail-open on config read errors
-            model_cfg = _load_gateway_config().get("model", {})
+            model_cfg = _load_gateway_config(config_path=ctx.config_path).get("model", {})
             if isinstance(model_cfg, dict) and model_cfg.get("context_length") is not None:
                 config_ctx = int(model_cfg["context_length"])
         if not isinstance(model_cfg, dict):
@@ -397,7 +397,9 @@ class GatewayModelCommandsMixin:
                 except Exception:
                     logger.warning("Global model config write failed", exc_info=True)
                     return applied.text() + " Global configuration write failed."
-                return applied.text() + " Global default saved."
+            if applied.applied and applied.changed:
+                confirmation = await self._model_switch_confirmation(result, ctx, one_turn=False, picker=picker)
+                return applied.text() + "\n" + confirmation
             return applied.text()
         async with self._session_state(ctx.session_key).persistent.settings_lock:
             error = self._switch_cached_agent_model(result, ctx, picker)

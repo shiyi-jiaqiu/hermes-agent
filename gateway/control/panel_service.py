@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType
 
 
 

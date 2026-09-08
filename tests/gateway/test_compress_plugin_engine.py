@@ -22,7 +22,7 @@ import pytest
 
 from agent.context_engine import ContextEngine
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.event import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
@@ -96,6 +96,8 @@ def _make_runner(history: list[dict[str, str]]):
         chat_type="dm",
     )
     runner.session_store = MagicMock()
+    runner.session_store.get_runtime_settings.return_value = None
+    runner.session_store.get_model_override.return_value = None
     runner.session_store.get_or_create_session.return_value = session_entry
     runner.session_store.load_transcript.return_value = history
     runner.session_store.rewrite_transcript = MagicMock()
