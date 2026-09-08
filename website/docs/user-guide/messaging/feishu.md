@@ -294,6 +294,11 @@ then route, reasoning and service tier are saved together for the next turn. Sto
 running turn before changing these settings. A failed session write leaves its
 previous settings in place. `--global` additionally writes the profile default;
 configuration and session writes are separate and any partial outcome is reported.
+The panel displays the effective session or channel route and the Feishu-specific
+reasoning display setting. Selecting unchanged settings keeps the current agent;
+refreshed credentials or capabilities still take effect. While a save is in progress,
+new turns ask you to retry shortly, and new/resume operations wait for that save.
+Closing the panel does not cancel a save that has already started.
 
 ```yaml
 mode_presets:
@@ -307,7 +312,10 @@ feishu_panel:
 
 Define the model aliases for your providers first. Provider visibility is controlled
 by this profile's configuration. Model discovery is shared across panels for the
-same profile/configuration version; each panel derives its own current selection.
+same profile and relevant provider/auth configuration; each panel derives its own
+current selection. Inventory results expire after five minutes. Refresh fetches
+provider inventories again, including their underlying model caches. New/resume
+invalidates session and status queries that started before the change.
 
 For configurations from the old Panel implementation, run
 `python -m scripts.migrate_feishu_settings --config ~/.hermes/config.yaml` to preview
@@ -355,7 +363,10 @@ group chats show file/addition/deletion summaries but not source lines.
 
 The card transport is presentation-only: it does not alter tool results,
 conversation history, prompts, or prompt caching. A card send/update failure stops
-progress display for that turn; tool execution and the final answer continue. The
+progress display for that turn; tool execution and the final answer continue.
+Each card operation has a five-second total budget, including authentication,
+thread lookup and retries. The turn waits at most five seconds for its final
+progress update, then stops publishing card state and releases the session. The
 card stays Working between tools until the turn explicitly finishes; interrupted
 and failed turns have distinct terminal states. Only active calls, a bounded recent
 history, and cumulative counters are kept for display. These cards have no buttons, so they require no app permission or event subscription beyond
