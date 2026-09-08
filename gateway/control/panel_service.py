@@ -7,6 +7,7 @@ import shlex
 from contextlib import asynccontextmanager
 import hashlib
 import json
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,9 +22,13 @@ class PanelControlResult:
 
 
 class HermesPanelControlService:
+    catalog_ttl = 300.0
+
     def __init__(self, runner: Any):
         self.runner = runner
         self._catalogs = {}
+        self._discoveries = set()
+        self._refresh_catalogs = set()
         self._closed = False
 
     @asynccontextmanager
@@ -37,38 +42,65 @@ class HermesPanelControlService:
         path = self.runner._resolve_profile_home_for_source(source) / "config.yaml"
         return _load_gateway_config(config_path=path) or {}
 
-    def _canonical_session_key(self, source, unused):
+    def _canonical_session_key(self, source):
         normalized = self.runner._normalize_source_for_session_key(source)
         return self.runner._session_key_for_source(normalized)
 
     async def close(self):
         self._closed = True
-        # Discovery tasks own their worker until completion, even if every view cancels.
-        await asyncio.gather(*self._catalogs.values(), return_exceptions=True)
+        # Workers only own their input config and network discovery. Keep references until
+        # completion, but closing a UI does not wait for optional provider inventory.
         self._catalogs.clear()
+        self._refresh_catalogs.clear()
+
+    def invalidate_catalog(self, source, *, refresh=True):
+        home = str(self.runner._resolve_profile_home_for_source(source))
+        if refresh:
+            self._refresh_catalogs.add(home)
+        for key in list(self._catalogs):
+            if key[0] == home:
+                del self._catalogs[key]
 
     async def _catalog(self, source, cfg):
         if self._closed:
             raise RuntimeError("Panel service is closed")
-        home = str(self.runner._resolve_profile_home_for_source(source))
-        version = hashlib.sha256(json.dumps(cfg, sort_keys=True, default=str).encode()).hexdigest()
-        key = (home, version)
-        task = self._catalogs.get(key)
-        if task is None:
-            for old, done in list(self._catalogs.items()):
-                if old[0] == home and done.done():
-                    del self._catalogs[old]
-            task = asyncio.create_task(asyncio.to_thread(self._discover_catalog, cfg))
-            self._catalogs[key] = task
+        path = self.runner._resolve_profile_home_for_source(source)
+        home = str(path)
+        relevant = {k: cfg.get(k) for k in ("model", "providers", "custom_providers", "model_catalog", "feishu_panel")}
+        version = hashlib.sha256(json.dumps(relevant, sort_keys=True, default=str).encode()).hexdigest()
+        auth_version = []
+        for name in (".env", "auth.json"):
+            try:
+                stat = (path / name).stat()
+                auth_version.append((stat.st_mtime_ns, stat.st_size, stat.st_ino))
+            except FileNotFoundError:
+                auth_version.append(None)
+        key = (home, version, tuple(auth_version))
+        cached = self._catalogs.get(key)
+        if cached is None or (cached[0].done() and time.monotonic() - cached[1] >= self.catalog_ttl):
+            force_refresh = home in self._refresh_catalogs or any(k[0] == home for k in self._catalogs)
+            self.invalidate_catalog(source, refresh=False)
+            self._refresh_catalogs.discard(home)
+            task = asyncio.create_task(asyncio.to_thread(self._discover_catalog, cfg, refresh=force_refresh))
+            self._discoveries.add(task)
+            cached = [task, float("inf")]
+            self._catalogs[key] = cached
+            def completed(done):
+                self._discoveries.discard(done)
+                cached[1] = time.monotonic()
+                if not done.cancelled():
+                    done.exception()
+            task.add_done_callback(completed)
+        task = cached[0]
         try:
             return await asyncio.shield(task)
         except Exception:
-            if self._catalogs.get(key) is task:
+            if self._catalogs.get(key) is cached:
                 del self._catalogs[key]
             raise
 
     @staticmethod
-    def _discover_catalog(cfg):
+    def _discover_catalog(cfg, *, refresh=False):
         from hermes_cli.config import get_compatible_custom_providers
         from hermes_cli.model_switch import list_authenticated_providers
         model = cfg.get("model") or {}
@@ -81,20 +113,12 @@ class HermesPanelControlService:
             current_provider=model.get("provider", ""), current_base_url=model.get("base_url", ""),
             current_model=model.get("default", ""), user_providers=cfg.get("providers"),
             custom_providers=get_compatible_custom_providers(cfg), max_models=2000,
-            probe_custom_providers=False, for_picker=True, excluded_providers=sorted(excluded))
+            probe_custom_providers=False, for_picker=True, excluded_providers=sorted(excluded), refresh=refresh)
         hidden = policy.get("hidden_model_prefixes") or {}
         return [{**row, "is_current": False,
                  "models": [m for m in row["models"] if not any(
                      m.startswith(prefix) for prefix in hidden.get(row["slug"], []))]}
                 for row in rows if row["slug"] not in excluded]
-
-    @staticmethod
-    def _reasoning_value(config: Any) -> str:
-        if not isinstance(config, dict):
-            return "medium"
-        if config.get("enabled") is False:
-            return "none"
-        return str(config.get("effort") or "medium")
 
     @staticmethod
     def _model_alias_target(spec: Any, fallback: str) -> tuple[str, str, str]:
@@ -165,58 +189,32 @@ class HermesPanelControlService:
         complete snapshot for direct non-Panel callers.
         """
         async with self._scope(source):
-            session_key = self._canonical_session_key(source, session_key)
+            session_key = self._canonical_session_key(source)
             cfg = self._config(source)
             # Complete discovery before sampling the session's selected values.
             provider_rows = await self._catalog(source, cfg) if include_catalog else []
-            raw_model_cfg = cfg.get("model")
-            model_cfg: dict[str, Any] = (
-                dict(raw_model_cfg) if isinstance(raw_model_cfg, dict) else {}
-            )
-            global_model = str(model_cfg.get("default") or "unknown")
-            global_provider = str(model_cfg.get("provider") or "")
-            self.runner._rehydrate_session_model_override(session_key)
-            model_override = self.runner._session_model_override(session_key) or {}
-            effective_model = str(model_override.get("model") or global_model)
-            effective_provider = str(model_override.get("provider") or global_provider)
-            effective_base_url = str(model_override.get("base_url", model_cfg.get("base_url")) or "")
-            effective_api_mode = str(model_override.get("api_mode", model_cfg.get("api_mode")) or "")
+            from .settings import GatewaySettingsEndpoint
+            from gateway.display_config import resolve_display_setting
+            from hermes_cli.runtime_settings import reasoning_name
+            from hermes_cli.models import resolve_fast_mode_overrides
+            from hermes_constants import resolve_reasoning_config
 
-            reasoning_cfg = self.runner._resolve_session_reasoning_config(
-                source=source,
-                session_key=session_key,
-                model=effective_model,
-            )
-            effective_reasoning = self._reasoning_value(reasoning_cfg)
-            raw_agent_cfg = cfg.get("agent")
-            agent_cfg: dict[str, Any] = (
-                dict(raw_agent_cfg) if isinstance(raw_agent_cfg, dict) else {}
-            )
-            raw_reasoning_overrides = agent_cfg.get("reasoning_overrides")
-            reasoning_overrides: dict[str, Any] = (
-                dict(raw_reasoning_overrides)
-                if isinstance(raw_reasoning_overrides, dict)
-                else {}
-            )
-            global_reasoning = str(
-                reasoning_overrides.get(effective_model)
-                or agent_cfg.get("reasoning_effort")
-                or "medium"
-            )
-            reasoning_state = self.runner._peek_session_state(session_key)
-            has_reasoning_override = bool(
-                reasoning_state is not None
-                and reasoning_state.conversation.reasoning_override is not None
-            )
-            fast_mode = self.runner._resolve_session_service_tier(
-                session_key=session_key
-            ) == "priority"
-            try:
-                from hermes_cli.models import model_supports_fast_mode
-
-                fast_supported = bool(model_supports_fast_mode(effective_model))
-            except Exception:
-                fast_supported = False
+            endpoint = GatewaySettingsEndpoint(self.runner, source, session_key, cfg, None)
+            async with self.runner._session_state(session_key).persistent.settings_lock:
+                actual = await endpoint.load()
+            model_cfg = cfg.get("model") or {}
+            if isinstance(model_cfg, str):
+                model_cfg = {"default": model_cfg}
+            global_model = model_cfg.get("default") or "unknown"
+            global_provider = model_cfg.get("provider") or ""
+            effective_model, effective_provider = actual.model, actual.provider
+            effective_base_url, effective_api_mode = actual.base_url, actual.api_mode
+            effective_reasoning = actual.reasoning
+            global_reasoning = reasoning_name(resolve_reasoning_config(cfg, actual.model))
+            has_reasoning_override = not actual.reasoning_inherited
+            fast_mode = actual.service_tier == "priority"
+            fast_supported = resolve_fast_mode_overrides(
+                actual.model, provider=actual.provider, base_url=actual.base_url) is not None
             running = bool(self.runner._is_session_running(session_key))
 
             raw_aliases = cfg.get("model_aliases")
@@ -297,16 +295,16 @@ class HermesPanelControlService:
                 "effective_provider": effective_provider,
                 "global_model": global_model,
                 "global_provider": global_provider,
-                "model_source": "本会话覆盖" if model_override else "Profile 全局默认",
+                "model_source": endpoint.model_source,
                 "effective_reasoning": effective_reasoning,
                 "global_reasoning": global_reasoning,
                 "reasoning_source": "本会话覆盖" if has_reasoning_override else "Profile 全局默认",
                 "value_source": (
                     "本会话覆盖"
-                    if model_override or has_reasoning_override
-                    else "Profile 全局默认"
+                    if endpoint.model_source == "本会话覆盖" or has_reasoning_override
+                    else endpoint.model_source
                 ),
-                "show_reasoning": bool(self.runner._load_show_reasoning()),
+                "show_reasoning": resolve_display_setting(cfg, source.platform.value, "show_reasoning"),
                 "fast_mode": fast_mode,
                 "fast_supported": fast_supported,
                 "fast_options": [
@@ -347,7 +345,7 @@ class HermesPanelControlService:
         from hermes_cli.runtime_settings import SettingsRequest, mode_request
         from .settings import apply_gateway_settings
         async with self._scope(source):
-            session_key = self._canonical_session_key(source, session_key)
+            session_key = self._canonical_session_key(source)
             command_for_target = {
                 "preset": "mode", "model": "model", "fast": "fast", "reasoning": "reasoning",
                 "global_reasoning": "reasoning", "reasoning_reset": "reasoning", "reasoning_display": "reasoning",

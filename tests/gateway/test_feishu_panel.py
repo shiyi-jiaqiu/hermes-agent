@@ -211,7 +211,7 @@ async def test_catalog_singleflight_survives_waiter_cancel_and_closes_after_work
     service = HermesPanelControlService(runner)
     started, release = threading.Event(), threading.Event()
     calls = []
-    def discover(cfg):
+    def discover(cfg, *, refresh=False):
         calls.append(cfg)
         started.set()
         assert release.wait(5)
@@ -226,7 +226,8 @@ async def test_catalog_singleflight_survives_waiter_cancel_and_closes_after_work
         await first
     closing = asyncio.create_task(service.close())
     await asyncio.sleep(0)
-    assert not closing.done() and len(calls) == 1
+    await closing
+    assert service._discoveries and len(calls) == 1
     release.set()
     assert (await second)[0]["models"] == ["model"]
     await closing
@@ -266,3 +267,141 @@ async def test_session_listing_uses_one_real_lane_scoped_query(tmp_path):
     assert query.call_args.kwargs["session_key"] == key
     await service.close()
     db.close()
+
+
+@pytest.mark.asyncio
+async def test_panel_reads_channel_route_platform_display_and_route_capabilities(tmp_path, monkeypatch):
+    from contextlib import asynccontextmanager
+    from gateway.config import ChannelOverride
+    from gateway.session_state import SessionState
+    from gateway.control.settings import GatewaySettingsEndpoint
+    from hermes_constants import resolve_reasoning_config
+    cfg = {'model': 'global-model', 'agent': {'reasoning_effort': 'low'},
+           'display': {'show_reasoning': False, 'platforms': {'feishu': {'show_reasoning': True}}}}
+    state = SessionState()
+    from gateway.run import GatewayRunner
+    runner = object.__new__(GatewayRunner)
+    runner.__dict__.update(config=object(),
+        _resolve_profile_home_for_source=lambda source: tmp_path,
+        _normalize_source_for_session_key=lambda source: source, _session_key_for_source=lambda source: 'key',
+        _load_session_model_override=lambda key: None, _session_model_override=lambda key: state.conversation.model_override,
+        _resolve_session_reasoning_config=lambda **kw: resolve_reasoning_config(cfg, kw['model']),
+        _resolve_session_service_tier=lambda **kw: None, _session_state=lambda key: state,
+        _peek_session_state=lambda key: state, _is_session_running=lambda key: False,
+        _load_show_reasoning=lambda: False)
+    monkeypatch.setattr('gateway.run._get_channel_override', lambda *a, **kw: ChannelOverride(model='channel-model', provider='proxy'))
+    calls = []
+    def fast(model, **route):
+        calls.append((model, route))
+        return {'service_tier': 'priority'} if route['provider'] == 'proxy' else None
+    monkeypatch.setattr('hermes_cli.models.resolve_fast_mode_overrides', fast)
+    service = HermesPanelControlService(runner)
+    @asynccontextmanager
+    async def scope(source):
+        yield
+    monkeypatch.setattr(service, '_scope', scope)
+    monkeypatch.setattr(service, '_config', lambda source: cfg)
+    actual = GatewaySettingsEndpoint(runner, SOURCE, 'key', cfg, 'session').read()
+    snapshot = await service.snapshot(source=SOURCE, session_key='key', include_catalog=False,
+                                      include_sessions=False, include_status=False)
+    assert snapshot['effective_model'] == actual.model == 'channel-model'
+    assert snapshot['effective_provider'] == actual.provider == 'proxy'
+    assert snapshot['show_reasoning'] is True and snapshot['fast_supported'] is True
+    assert snapshot['model_source'] == '频道配置'
+    assert calls[-1] == ('channel-model', {'provider': 'proxy', 'base_url': ''})
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_catalog_refresh_and_expiry_preserve_singleflight(tmp_path, monkeypatch):
+    runner = SimpleNamespace(_resolve_profile_home_for_source=lambda source: tmp_path)
+    service = HermesPanelControlService(runner)
+    inventory, calls = ['a'], []
+    def discover(cfg, *, refresh=False):
+        calls.append(refresh)
+        return list(inventory)
+    monkeypatch.setattr(service, '_discover_catalog', discover)
+    assert await service._catalog(SOURCE, {}) == ['a']
+    inventory.append('b')
+    service.invalidate_catalog(SOURCE)
+    results = await asyncio.gather(service._catalog(SOURCE, {}), service._catalog(SOURCE, {}))
+    assert results == [['a', 'b'], ['a', 'b']] and calls == [False, True]
+    inventory.append('c')
+    monkeypatch.setattr(service, 'catalog_ttl', 0)
+    assert await service._catalog(SOURCE, {}) == ['a', 'b', 'c']
+    monkeypatch.setattr(service, 'catalog_ttl', 300)
+    assert await service._catalog(SOURCE, {'display': {'show_reasoning': True}}) == ['a', 'b', 'c']
+    assert calls == [False, True, True]
+    (tmp_path / 'auth.json').write_text('{}')
+    inventory.append('d')
+    assert await service._catalog(SOURCE, {}) == ['a', 'b', 'c', 'd']
+    assert calls[-1] is True
+    await service.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('target', ['new', 'resume'])
+async def test_session_change_invalidates_inflight_view_results(target):
+    class DelayedService(Service):
+        async def snapshot(self, **options):
+            result = await super().snapshot(**options)
+            if options['include_sessions']:
+                self.load_started.set()
+                await self.release.wait()
+                result['sessions'] = [{'id': 'obsolete', 'label': 'obsolete'}]
+            return result
+    service = DelayedService()
+    controller, adapter, service, state = await opened(service)
+    try:
+        handle(controller, action(controller, state, target='sessions'))
+        await service.load_started.wait()
+        handle(controller, action(controller, state, op='exec', target=target, nonce='change'))
+        await asyncio.gather(*controller._controls.values())
+        service.release.set()
+        await asyncio.gather(*controller._tasks)
+        latest = controller._states[state.panel_id]
+        assert 'sessions' not in latest.data['loaded_views']
+        assert not latest.data['sessions']
+    finally:
+        await controller.close()
+
+
+@pytest.mark.asyncio
+async def test_refresh_starts_new_generation_while_old_model_query_is_still_running(tmp_path, monkeypatch):
+    inventory_started, release = threading.Event(), threading.Event()
+    catalog = HermesPanelControlService(SimpleNamespace(_resolve_profile_home_for_source=lambda source: tmp_path))
+    calls = []
+    def discover(cfg, *, refresh=False):
+        calls.append(refresh)
+        if not refresh:
+            inventory_started.set()
+            assert release.wait(5)
+            return ['obsolete']
+        return ['fresh']
+    monkeypatch.setattr(catalog, '_discover_catalog', discover)
+    class CatalogView(Service):
+        invalidate_catalog = catalog.invalidate_catalog
+        async def snapshot(self, **options):
+            result = await super().snapshot(**options)
+            if options['include_catalog']:
+                models = await catalog._catalog(options['source'], {})
+                result['model_options'] = [{'model': m, 'target': m, 'label': m, 'provider': 'p'} for m in models]
+            return result
+        async def close(self):
+            await super().close()
+            await catalog.close()
+    controller, adapter, service, state = await opened(CatalogView())
+    try:
+        handle(controller, action(controller, state, target='model'))
+        assert await asyncio.to_thread(inventory_started.wait, 5)
+        old_load = controller._loads[(state.panel_id, 'model')]
+        handle(controller, action(controller, state, op='refresh', nonce='refresh'))
+        await controller._loads[(state.panel_id, 'model')]
+        release.set()
+        await old_load
+        latest = controller._states[state.panel_id]
+        assert latest.data['model_options'][0]['model'] == 'fresh'
+        assert 'model' in latest.data['loaded_views'] and calls == [False, True]
+    finally:
+        release.set()
+        await controller.close()

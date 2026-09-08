@@ -37,8 +37,9 @@ class FeishuPanelController:
         self._sources: dict[str, Any] = {}
         self._tasks: set[asyncio.Task] = set()
         self._senders: dict[str, asyncio.Task] = {}
-        self._pending_cards: dict[str, dict] = {}
+        self._pending_cards: dict[str, PanelState] = {}
         self._loads: dict[tuple[str, str], asyncio.Task] = {}
+        self._view_generations: dict[tuple[str, str], int] = {}
         self._controls: dict[str, asyncio.Task] = {}
         self._executing: dict[str, int] = {}
         self._open_locks: dict[tuple, asyncio.Lock] = {}
@@ -73,6 +74,7 @@ class FeishuPanelController:
         self._sources.clear()
         self._pending_cards.clear()
         self._loads.clear()
+        self._view_generations.clear()
         self._controls.clear()
         self._executing.clear()
         self._senders.clear()
@@ -187,20 +189,23 @@ class FeishuPanelController:
         self._sources.pop(state.panel_id, None)
         self._messages.pop(state.panel_id, None)
         self._pending_cards.pop(state.panel_id, None)
+        for key in list(self._view_generations):
+            if key[0] == state.panel_id:
+                del self._view_generations[key]
         if self._active.get(state.scope_key) == state.panel_id:
             del self._active[state.scope_key]
 
     def _queue_card(self, state: PanelState) -> None:
         if self._closed or state.panel_id not in self._messages:
             return
-        self._pending_cards[state.panel_id] = render_panel(state)
+        self._pending_cards[state.panel_id] = state
         if state.panel_id not in self._senders:
             self._senders[state.panel_id] = self._spawn(self._send_cards(state.panel_id))
 
     async def _send_cards(self, panel_id: str) -> None:
         try:
             while panel_id in self._pending_cards:
-                card = self._pending_cards.pop(panel_id)
+                card = render_panel(self._pending_cards.pop(panel_id))
                 result = await self.adapter.patch_interactive_message(
                     message_id=self._messages[panel_id], card=card)
                 if not result.success:
@@ -222,10 +227,19 @@ class FeishuPanelController:
             return False
         key = panel_id, view
         if key not in self._loads:
-            self._loads[key] = self._spawn(self._load_view(panel_id, view))
+            generation = self._view_generations.get(key, 0)
+            self._loads[key] = self._spawn(self._load_view(panel_id, view, generation))
         return True
 
-    async def _load_view(self, panel_id: str, view: str) -> None:
+    def _invalidate_views(self, state, views):
+        for view in views:
+            key = state.panel_id, view
+            self._view_generations[key] = self._view_generations.get(key, 0) + 1
+            self._loads.pop(key, None)  # old tasks remain owned; their results cannot publish
+        state.data["loaded_views"] = [v for v in state.data["loaded_views"] if v not in views]
+        state.data["loading_views"] = [v for v in state.data["loading_views"] if v not in views]
+
+    async def _load_view(self, panel_id: str, view: str, generation: int) -> None:
         try:
             state = self._states[panel_id]
             snapshot = await self.service.snapshot(
@@ -242,9 +256,11 @@ class FeishuPanelController:
             logger.warning("Panel view failed: %s", exc)
             payload, error = {}, "加载失败，请刷新重试"
         finally:
-            self._loads.pop((panel_id, view), None)
-        latest = self._states[panel_id]
-        if not self._is_active(latest):
+            if self._loads.get((panel_id, view)) is asyncio.current_task():
+                self._loads.pop((panel_id, view), None)
+        latest = self._states.get(panel_id)
+        if (self._closed or latest is None or not self._is_active(latest)
+                or generation != self._view_generations.get((panel_id, view), 0)):
             return
         latest.data.update(payload)
         latest.data["loading_views"] = [v for v in latest.data["loading_views"] if v != view]
@@ -337,7 +353,9 @@ class FeishuPanelController:
         if action.op == "refresh":
             updated = state.clone()
             view = self._load_view_name(updated.view) or "home"
-            updated.data["loaded_views"] = [v for v in updated.data["loaded_views"] if v != view]
+            self._invalidate_views(updated, {view})
+            if view == "model":
+                self.service.invalidate_catalog(self._sources[state.panel_id])
             return updated
         if action.op != "select":
             return reduce_panel_state(state, action)
@@ -395,7 +413,7 @@ class FeishuPanelController:
         latest.data["flash"] = flash
         latest.data.pop("pending_global_reasoning_index", None)
         invalidated = {"status", "sessions"} if action.target in {"new", "resume"} else {"status"}
-        latest.data["loaded_views"] = [v for v in latest.data["loaded_views"] if v not in invalidated]
+        self._invalidate_views(latest, invalidated)
         if action.target in {"new", "resume", "preset"}:
             latest.view, latest.view_stack, latest.page = "home", [], 0
         elif action.target == "global_reasoning":
