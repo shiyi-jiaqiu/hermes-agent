@@ -211,6 +211,17 @@ FEISHU_REQUIRE_MENTION=false
 
 如需按群控制，在 `group_rules` 条目中设置 `require_mention`——参见下方[按群访问控制](#per-group-access-control)。
 
+在话题群中，可以将创建话题的首帖只作为标题，不自动触发 AI。该设置与是否需要 @ 独立：
+
+```yaml
+platforms:
+  feishu:
+    extra:
+      ignore_topic_roots: true
+```
+
+此选项只跳过已确认属于话题群的非命令首帖。话题内的后续回复和 `/panel` 等显式命令仍正常处理，普通群聊与私聊保持原有行为。默认值为 `false`，不会自动打开控制面板。
+
 ### 机器人身份
 
 Hermes 在启动时自动检测机器人的 `open_id` 和显示名称。仅当自动检测无法访问飞书 API，或你的应用使用租户范围用户 ID 时，才需要手动设置：

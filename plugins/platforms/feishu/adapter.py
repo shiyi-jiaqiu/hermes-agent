@@ -310,6 +310,7 @@ class FeishuAdapterSettings:
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
+    ignore_topic_roots: bool = False
     allow_all_dm: bool = False  # resolved per-profile so multiplexed adapters honor their own .env
     menu_default_chat_id: str = ""
     menu_routes: dict[str, str] = field(default_factory=dict)
@@ -1340,6 +1341,7 @@ class FeishuAdapter(FeishuCardsMixin, BasePlatformAdapter):
             menu_routes={str(k): str(v) for k, v in (extra.get("menu_routes") or {}).items()
                          if str(v).startswith("/")},
             require_mention=_to_boolean(extra.get("require_mention", _get_scoped_secret("FEISHU_REQUIRE_MENTION", "true"))),
+            ignore_topic_roots=_to_boolean(extra.get("ignore_topic_roots", False)),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1901,6 +1903,7 @@ class FeishuAdapter(FeishuCardsMixin, BasePlatformAdapter):
             info = {
                 "chat_id": chat_id, "name": str(getattr(data, "name", None) or chat_id),
                 "type": self._map_chat_type(raw_chat_type), "raw_type": raw_chat_type or None,
+                "chat_mode": str(getattr(data, "chat_mode", "") or "").strip().lower() or None,
             }
             self._chat_info_cache[chat_id] = info
             return dict(info)
@@ -2531,6 +2534,14 @@ class FeishuAdapter(FeishuCardsMixin, BasePlatformAdapter):
         if inbound_type == MessageType.TEXT and not text and not media_urls:
             logger.debug("[Feishu] Ignoring empty text message id=%s", message_id)
             return
+        chat_id = getattr(message, "chat_id", "") or ""
+        chat_info = await self.get_chat_info(chat_id)
+        from .adapter_topics import is_topic_root
+        if (inbound_type != MessageType.COMMAND
+                and is_topic_root(message, chat_mode=chat_info.get("chat_mode"), event_chat_type=chat_type)
+                and self._ignore_topic_roots):
+            logger.info("[Feishu] Topic root retained as title only: id=%s", message_id)
+            return
         if inbound_type != MessageType.COMMAND:
             hint = _build_mention_hint(mentions)
             if hint:
@@ -2546,14 +2557,12 @@ class FeishuAdapter(FeishuCardsMixin, BasePlatformAdapter):
             getattr(sender_id, "open_id", None) or getattr(sender_id, "user_id", None)
             or getattr(sender_id, "union_id", None) or "<unknown>"
         )
-        chat_id = getattr(message, "chat_id", "") or ""
         logger.info(
             "[Feishu] Inbound %s message received: id=%s type=%s chat_id=%s sender=%s:%s text=%r media=%d",
             "dm" if chat_type == "p2p" else "group", message_id, inbound_type.value, chat_id,
             "bot" if is_bot else "user", sender_primary, text[:120], len(media_urls),
         )
 
-        chat_info = await self.get_chat_info(chat_id)
         sender_profile = await self._resolve_sender_profile(sender_id, is_bot=is_bot)
         source = self.build_source(
             chat_id=chat_id,

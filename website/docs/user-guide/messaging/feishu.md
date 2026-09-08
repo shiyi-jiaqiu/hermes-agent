@@ -245,6 +245,21 @@ FEISHU_REQUIRE_MENTION=false
 
 For per-chat control, set `require_mention` on a `group_rules` entry — see [Per-Group Access Control](#per-group-access-control) below.
 
+In topic groups, you can treat the first post as a topic title rather than an AI
+request. Enable this independently of the @mention policy:
+
+```yaml
+platforms:
+  feishu:
+    extra:
+      ignore_topic_roots: true
+```
+
+This skips non-command root posts only in chats identified as topic groups.
+Replies inside the topic and explicit commands such as `/panel` still work.
+Ordinary groups and direct messages keep their existing behavior. The option
+defaults to `false`; it does not automatically open a control panel.
+
 ### Bot Identity
 
 Hermes auto-detects the bot's `open_id` and display name on startup. You only need to set these manually when auto-detection cannot reach the Feishu API, or when your app uses tenant-scoped user IDs:
