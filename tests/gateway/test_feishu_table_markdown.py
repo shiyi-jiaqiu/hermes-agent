@@ -15,9 +15,14 @@ from __future__ import annotations
 
 import json
 
-from tests.gateway._plugin_adapter_loader import load_plugin_adapter
+from pathlib import Path
+from hermes_cli.plugins_loader import PluginLoaderMixin
+from hermes_cli.plugins_manifest import PluginManifest
 
-_adapter = load_plugin_adapter("feishu")
+_plugin = PluginLoaderMixin()._load_directory_module(
+    PluginManifest("feishu", path=str(Path(__file__).resolve().parents[2] / "plugins/platforms/feishu")),
+    module_name="hermes_plugins.feishu_table_test")
+_adapter = _plugin.adapter
 
 
 def _call_build_outbound_payload(content: str) -> tuple[str, str]:

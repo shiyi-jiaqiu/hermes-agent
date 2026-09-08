@@ -3538,7 +3538,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
             n = len(submit_images)
             _cprint(f"  {_DIM}📎 {n} image{'s' if n > 1 else ''} attached{_RST}")
 
-        self._agent_running = self._interactive_turn = True
+        from hermes_cli.settings_endpoint import runtime_settings_lock
+        with runtime_settings_lock(self):
+            self._agent_running = self._interactive_turn = True
         self._pet_turn_error = self._pet_reasoning = False
         self._turn_summary_begin()
         self._app.invalidate()

@@ -2268,11 +2268,11 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
         context_length=context_length, context_source=context_source)
 
 
-def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
+def _resolve_runtime_agent_kwargs_for_provider(provider: str, *, base_url=None, model=None) -> dict:
     """Resolve runtime credentials for a specific provider (e.g. from channel override)."""
     from hermes_cli.runtime_provider import resolve_runtime_provider, format_runtime_provider_error
     try:
-        runtime = resolve_runtime_provider(requested=provider)
+        runtime = resolve_runtime_provider(requested=provider, explicit_base_url=base_url, target_model=model)
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
     return {
@@ -2294,12 +2294,13 @@ def _deep_merge_request_overrides(base: Optional[dict], override: Optional[dict]
     return _deep_merge(base_dict, override_dict)
 
 
-def _credential_pool_for_provider(provider: Optional[str]):
+def _credential_pool_for_provider(provider: Optional[str], *, base_url=None, model=None):
     """Return the live credential pool for a provider id (e.g. ``custom:hyper``)."""
     if not provider or not str(provider).strip():
         return None
     try:
-        return _resolve_runtime_agent_kwargs_for_provider(str(provider).strip()).get("credential_pool")
+        return _resolve_runtime_agent_kwargs_for_provider(
+            str(provider).strip(), base_url=base_url, model=model).get("credential_pool")
     except Exception:
         logger.debug("Failed to resolve credential pool for provider=%s", provider, exc_info=True)
         return None

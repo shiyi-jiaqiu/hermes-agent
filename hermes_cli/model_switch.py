@@ -185,6 +185,7 @@ class DirectAlias(NamedTuple):
     base_url: str
     api_key: str = ""
     key_env: str = ""
+    api_mode: str = ""
 
 
 # Built-in direct aliases (extended via config.yaml model_aliases:)
@@ -222,7 +223,7 @@ def _load_direct_aliases() -> dict[str, DirectAlias]:
                     merged[name.strip().lower()] = DirectAlias(
                         model=entry.get("model", ""), provider=entry.get("provider", "custom"),
                         base_url=entry.get("base_url", ""), api_key=_clean(entry.get("api_key", "")),
-                        key_env=_clean(entry.get("key_env", "")))
+                        key_env=_clean(entry.get("key_env", "")), api_mode=_clean(entry.get("api_mode", "")))
 
         model_section = cfg.get("model", {})
         simple_aliases = model_section.get("aliases") if isinstance(model_section, dict) else None
@@ -237,7 +238,7 @@ def _load_direct_aliases() -> dict[str, DirectAlias]:
                     if model:
                         merged[key] = DirectAlias(
                             model=model, provider=_clean(value.get("provider")) or current_provider or "custom",
-                            base_url=_clean(value.get("base_url")))
+                            base_url=_clean(value.get("base_url")), api_mode=_clean(value.get("api_mode")))
                 elif isinstance(value, str) and value.strip():
                     val = value.strip()
                     provider, model = val.split("/", 1) if "/" in val else (current_provider, val)
@@ -978,6 +979,7 @@ def _apply_direct_alias_endpoint(st: "_Switch", da: DirectAlias) -> None:
     resolves for ollama.com, OPENROUTER_API_KEY never reaches an unrelated host)."""
     from hermes_cli.models_local import _same_ollama_native_root
     from hermes_cli.runtime_provider import resolve_runtime_provider
+    alias_runtime = {}
     alias_key = direct_alias_api_key(da)
     same_host = _may_reuse_session_credential(st.base_url, da.base_url)
     if alias_key:
@@ -1013,7 +1015,7 @@ def _apply_direct_alias_endpoint(st: "_Switch", da: DirectAlias) -> None:
             # Different origin, or no configured root to safely associate the headers with.
             st.validation_headers, st.suppress_ollama_headers, st.api_key = {}, True, "no-key-required"
     st.api_key = st.api_key or "no-key-required"
-    st.api_mode = ""  # clear so determine_api_mode re-detects from URL
+    st.api_mode = da.api_mode or alias_runtime.get("api_mode") or st.api_mode
 
 
 def _moa_default_preset() -> str:
@@ -1327,8 +1329,11 @@ def _resolve_switch_credentials(st: _Switch) -> Optional[ModelSwitchResult]:
     if st.resolved_alias:
         _ensure_direct_aliases()
         da = DIRECT_ALIASES.get(st.resolved_alias)
-        if da is not None and da.base_url:
-            _apply_direct_alias_endpoint(st, da)
+        if da is not None:
+            if da.base_url:
+                _apply_direct_alias_endpoint(st, da)
+            if da.api_mode:
+                st.api_mode = da.api_mode
 
     # Fills an empty mode (alias cleared it) and overrides a STALE mode carried from previous
     # session state when the host mandates one wire protocol (e.g. gpt-5.x on api.openai.com

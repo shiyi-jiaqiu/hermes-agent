@@ -61,6 +61,18 @@ class TestHandleFastCommand(unittest.TestCase):
     def test_normal_argument_clears_service_tier(self):
         cli_mod = _import_cli()
         stub = self._make_cli(service_tier="priority")
+        from hermes_state import SessionDB
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        db = SessionDB(db_path=Path(directory.name) / "state.db")
+        self.addCleanup(db.close)
+        stub.session_id, stub._session_db = "settings", db
+        stub.model, stub.provider = "gpt-5.4", "openai-codex"
+        stub.base_url, stub.api_mode, stub.api_key = "", "codex_responses", ""
+        stub.service_tier = getattr(stub, "service_tier", None)
+        stub.reasoning_config = getattr(stub, "reasoning_config", None)
         with (
             patch.object(cli_mod, "_cprint"),
             patch.object(cli_mod, "save_config_value", return_value=True) as mock_save,

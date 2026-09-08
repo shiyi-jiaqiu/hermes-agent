@@ -1821,6 +1821,14 @@ class BasePlatformAdapter(ABC):
     # Typing indicator renders TEXT (status line); the gateway then feeds set_status_text().
     supports_status_text: bool = False
 
+    async def open_control_panel(self, event, *, session_key, metadata, initial_view):
+        """Optional native control surface; the adapter owns identity and card transport."""
+        return SendResult(success=False, error="Interactive control panels are not available on this platform")
+
+    def create_tool_progress(self, source, config):
+        """Optional per-turn native progress consumer (start, complete, finish, send_events)."""
+        return None
+
     def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
         """Set or clear (``None``) the live working-state phrase for a chat. In-memory only: the
         next typing refresh renders it; a no-op store on adapters that never read

@@ -627,6 +627,27 @@ class SessionSessionsMixin:
         payload = json.dumps(list(tool_names)) if tool_names is not None else None
         self._write_sql("UPDATE sessions SET tool_names = ? WHERE id = ?", (payload, session_id))
 
+    def update_runtime_settings(self, session_id: str, settings: dict) -> None:
+        """Atomically persist the complete route and tuning, retaining unrelated metadata."""
+        from hermes_constants import parse_reasoning_effort
+        self.flush_token_counts()
+        route = {k: settings[k] for k in ("model", "provider", "base_url", "api_mode")}
+        patch = {**route, "settings_override": True, "reasoning_inherited": settings.get("reasoning_inherited", False),
+                 "reasoning_config": parse_reasoning_effort(settings["reasoning"]),
+                 "service_tier": settings["service_tier"], "gateway_runtime": route,
+                 "browser_model_lock": None}
+        def write(conn):
+            merged = self._merge_model_config_json(conn, session_id, patch, on_missing="raise")
+            conn.execute("UPDATE sessions SET model = ?, model_config = ?, system_prompt = NULL, "
+                         "system_prompt_hash = NULL WHERE id = ?", (settings["model"], merged, session_id))
+            self._delete_unreferenced_system_prompts(conn)
+        self._execute_write(write)
+
+    def get_runtime_settings(self, session_id: str) -> Optional[dict]:
+        """Read settings from the canonical route and tuning fields."""
+        from hermes_cli.runtime_settings import stored_settings
+        return stored_settings(self.get_session(session_id))
+
     def update_session_model(self, session_id: str, model: str, provider: Optional[str] = None) -> None:
         """Set the model after a mid-session /model switch (unconditionally), null system_prompt so
         stale Model:/Provider: footers rebuild, and drop any Browser runtime lock (lineage markers

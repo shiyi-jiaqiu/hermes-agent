@@ -143,6 +143,24 @@ def _commit_model_switch(
     ``picker``: tolerate context-resolution errors and label the config write "(--global)"; the
     typed path additionally records the one-turn restore snapshot."""
     from cli import HermesCLI, _cprint
+    if not one_turn:
+        old_model = cli.model
+        from hermes_cli.config import load_config
+        from hermes_cli.runtime_settings import SettingsRequest
+        from hermes_cli.settings_endpoint import apply_cli_settings
+        applied = apply_cli_settings(cli, SettingsRequest(result.new_model, result.target_provider),
+                                 load_config(), resolver=lambda **kwargs: result)
+        _cprint(applied.text())
+        if applied.applied:
+            _print_switch_summary(cli, result, old_model, one_turn=False, strict_context=False)
+        if applied.applied and persist_global:
+            try:
+                _persist_global_switch(cli, result)
+            except Exception:
+                _cprint("Session settings saved, but the global configuration could not be fully written.")
+            else:
+                _cprint("Saved to config.yaml (--global)")
+        return
     old_model = cli.model
     snapshot = cli._snapshot_model_runtime() if one_turn else None
     if not cli._stage_and_swap_model(result, old_model):
@@ -167,18 +185,18 @@ def _persist_global_switch(cli, result) -> None:
     """Write the switched route to config.yaml (--global). base_url/api_mode are freshly resolved
     for the target provider, so sync them every time (None clears a value the new provider doesn't
     need) — otherwise the OLD provider's endpoint/wire-protocol lingers in config.yaml."""
-    from cli import HermesCLI, save_config_value
+    from cli import CLI_CONFIG, HermesCLI, save_config_value
     HermesCLI._clear_persisted_context_for_model_switch(cli, result)
-    save_config_value("model.default", result.new_model)
-    save_config_value("model.provider", result.target_provider)
-    # base_url/api_mode were previously never persisted here, so a global switch left the OLD provider's
-    # endpoint/wire-protocol in config.yaml. result.base_url/api_mode are always freshly resolved for the
-    # target provider (see model_switch.py), so sync them every time; None clears a value the new provider
-    # doesn't need (#25106).
-    # See _apply_model_switch_result above for why base_url/api_mode must be synced on every global switch
-    # (#25106).
-    save_config_value("model.base_url", result.base_url or None)
-    save_config_value("model.api_mode", result.api_mode or None)
+    for key, value in (("default", result.new_model), ("provider", result.target_provider),
+                       ("base_url", result.base_url or None), ("api_mode", result.api_mode or None)):
+        if not save_config_value("model." + key, value):
+            raise OSError("Global model configuration write failed")
+
+    model_config = CLI_CONFIG.get("model")
+    if not isinstance(model_config, dict):
+        model_config = CLI_CONFIG["model"] = {}
+    model_config.update(default=result.new_model, provider=result.target_provider,
+                        base_url=result.base_url or None, api_mode=result.api_mode or None)
 
 
 def _show_model_picker(cli, ctx, force_refresh: bool) -> None:
@@ -350,6 +368,25 @@ class CLIModelSwitchMixin:
         from cli import logger
         stored_model = (session_meta or {}).get("model")
         if not stored_model or getattr(self, "_explicit_model_override", False):
+            return
+        from hermes_cli.runtime_settings import RuntimeSettings, stored_settings
+        saved = stored_settings(session_meta)
+        if saved is not None:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            from hermes_cli.settings_endpoint import CLISettingsEndpoint
+            runtime = resolve_runtime_provider(requested=saved["provider"] or None,
+                                               explicit_base_url=saved["base_url"] or None,
+                                               target_model=saved["model"])
+            if saved["reasoning_inherited"]:
+                from hermes_constants import resolve_reasoning_config
+                from hermes_cli.config import load_config
+                from hermes_cli.runtime_settings import reasoning_name
+                saved["reasoning"] = reasoning_name(resolve_reasoning_config(load_config(), saved["model"]))
+            settings = RuntimeSettings(**saved, api_key=runtime.get("api_key") or "",
+                                       request_overrides=runtime.get("request_overrides"),
+                                       capabilities=runtime.get("capabilities"))
+            CLISettingsEndpoint(self).publish(settings)
+            self._credential_pool = runtime.get("credential_pool")
             return
         # Canonical row reader: model_config.gateway_runtime, else the TUI's top-level keys.
         from hermes_state import SessionDB as _SessionDB
@@ -570,6 +607,7 @@ class CLIModelSwitchMixin:
         # (e.g. Ollama api_key/base_url) don't leak into the next resolution.
         self._explicit_api_key = result.api_key
         self._explicit_base_url = result.base_url
+        self._explicit_api_mode = result.api_mode
         if result.api_key:
             self.api_key = result.api_key
         if result.base_url:

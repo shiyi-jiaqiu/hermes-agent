@@ -113,7 +113,7 @@ class TurnRunner:
             return
         # Native task cards consume the ID-bearing tool_start/tool_complete callbacks instead;
         # name-correlated text events would duplicate cards and mispair concurrent same-tool calls.
-        if ctx._native_slack_task_cards and event_type in {"tool.started", "tool.completed"}:
+        if (ctx._native_slack_task_cards or ctx.native_progress is not None) and event_type in {"tool.started", "tool.completed"}:
             return
         # tool_progress off → only _thinking passes (above). Only tool.started renders. clarify:
         # send_clarify IS the user-facing rendering (a bubble would duplicate it, and verbose mode
@@ -585,6 +585,10 @@ class TurnRunner:
         adapter = self._runner._adapter_for_source(ctx.source) if ctx.progress_queue else None
         if not adapter:
             return
+        if ctx.native_progress is not None:
+            await ctx.native_progress.send_events(ctx.progress_queue, reply_to=ctx._progress_reply_to,
+                metadata=ctx._progress_metadata, on_delivery=self._track_progress_result)
+            return
         if ctx._native_slack_task_cards and hasattr(adapter, "send_native_task_card_progress"):
             await self._send_native_task_card_progress(adapter)
             return
@@ -670,6 +674,9 @@ class TurnRunner:
         """Queue an ID-correlated native progress start from the agent thread."""
         if not self._native_card_gate():
             return
+        if self._ctx.native_progress is not None:
+            self._ctx.native_progress.start(self._ctx.progress_queue, call_id, tool_name, args or {})
+            return
         from agent.display import build_tool_preview
         name = str(tool_name or "tool")
         self._ctx.progress_queue.put({
@@ -679,6 +686,9 @@ class TurnRunner:
 
     def native_tool_complete_callback(self, call_id, tool_name, args, result):
         """Queue the matching native completion using the real tool-call ID."""
+        if self._ctx.native_progress is not None:
+            self._ctx.native_progress.complete(self._ctx.progress_queue, call_id, tool_name, args or {}, result)
+            return
         if not self._native_card_gate():
             return
         from agent.display import _detect_tool_failure
@@ -692,7 +702,7 @@ class TurnRunner:
         """Compose the voice ack + native task-card start consumers."""
         if self._ctx._voice_ack_guild[0] is not None:
             self.voice_ack_callback(call_id, tool_name, args)
-        if self._ctx._native_slack_task_cards:
+        if self._ctx._native_slack_task_cards or self._ctx.native_progress is not None:
             self.native_tool_start_callback(call_id, tool_name, args)
 
     # ── hook / status bridges (agent thread → gateway loop) ────────────────────────────────
@@ -1096,9 +1106,9 @@ class TurnRunner:
         # callback, so neither infers identity from tool names.
         agent.tool_start_callback = (
             (ctx.native_tool_start_callback or ctx.voice_ack_callback)
-            if (ctx._voice_ack_guild[0] is not None or ctx._native_slack_task_cards) else None
+            if (ctx._voice_ack_guild[0] is not None or ctx._native_slack_task_cards or ctx.native_progress is not None) else None
         )
-        agent.tool_complete_callback = ctx.native_tool_complete_callback if ctx._native_slack_task_cards else None
+        agent.tool_complete_callback = ctx.native_tool_complete_callback if (ctx._native_slack_task_cards or ctx.native_progress is not None) else None
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = stream_delta_cb
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None

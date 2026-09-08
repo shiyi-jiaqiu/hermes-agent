@@ -154,22 +154,24 @@ class GatewayAgentCacheMixin:
         if self._session_model_override(session_key) is not None or store is None:
             return
         try:
-            persisted = store.get_model_override(session_key)
+            persisted = store.get_runtime_settings(session_key) or store.get_model_override(session_key)
         except Exception:
             logger.debug("Failed to read persisted session model override", exc_info=True)
             return
         if not persisted:
             return
-        override: Dict[str, Any] = {k: persisted.get(k) for k in ("model", "provider", "base_url")}
+        override: Dict[str, Any] = {k: persisted.get(k) for k in ("model", "provider", "base_url", "api_mode")}
         provider = persisted.get("provider")
         if provider:
             # Re-resolve credentials for the persisted provider. On failure (e.g. credentials removed
             # since the switch) keep the credential-less override — _resolve_session_agent_runtime
             # falls back to env resolution and layers model/provider.
             try:
-                runtime = _resolve_runtime_agent_kwargs_for_provider(provider)
+                runtime = _resolve_runtime_agent_kwargs_for_provider(
+                    provider, base_url=override.get("base_url"), model=override.get("model"))
                 for k in ("api_key", "api_mode", "credential_pool", "requested_provider", "max_tokens"):
-                    override[k] = runtime.get(k)
+                    if k != "api_mode" or not override.get(k):
+                        override[k] = runtime.get(k)
                 override["request_overrides"] = dict(runtime.get("request_overrides") or {})
                 override["capabilities"] = dict(runtime.get("capabilities") or {})
                 if not override.get("base_url"):
@@ -179,6 +181,13 @@ class GatewayAgentCacheMixin:
                     "Credential re-resolution failed for persisted override "
                     "(provider=%s); using credential-less override", provider, exc_info=True,
                 )
+        settings = store.get_runtime_settings(session_key)
+        if settings:
+            from hermes_constants import parse_reasoning_effort
+            self._set_session_reasoning_override(session_key, None if settings.get("reasoning_inherited")
+                                                 else parse_reasoning_effort(settings["reasoning"]))
+            self._set_session_service_tier_override(
+                session_key, None if settings["service_tier"] == "normal" else settings["service_tier"])
         self._session_state(session_key).conversation.model_override = override
         logger.info(
             "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
@@ -208,7 +217,8 @@ class GatewayAgentCacheMixin:
             and runtime_kwargs.get("credential_pool") is None
             and override.get("provider")
         ):
-            runtime_kwargs["credential_pool"] = _credential_pool_for_provider(override.get("provider"))
+            runtime_kwargs["credential_pool"] = _credential_pool_for_provider(
+                override.get("provider"), base_url=override.get("base_url"), model=model)
         return model, runtime_kwargs
 
     def _snapshot_session_model_override(self, session_key: str) -> dict:

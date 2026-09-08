@@ -52,6 +52,13 @@ def _install_fake_agent(monkeypatch):
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
 
+@pytest.fixture(autouse=True)
+def runtime_credentials(monkeypatch):
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **kwargs: {
+        "model": kwargs.get("target_model") or "gpt-5.4", "provider": kwargs.get("requested") or "openai-codex",
+        "api_key": "test-key", "base_url": "https://chatgpt.com/backend-api/codex", "api_mode": "codex_responses"})
+
+
 def _make_runner():
     runner = object.__new__(gateway_run.GatewayRunner)
     runner.adapters = {}
@@ -132,20 +139,31 @@ def test_turn_route_injects_priority_processing_without_changing_runtime():
 @pytest.mark.asyncio
 async def test_handle_fast_command_global_flag_persists_config(monkeypatch, tmp_path):
     runner = _make_runner()
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+    from hermes_state import SessionDB
+    runner.session_store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    db = SessionDB(db_path=tmp_path / "state.db")
+    runner.session_store._db_pinned = db
+    runner.config = GatewayConfig()
+    runner._normalize_source_for_session_key = lambda source: source
+    runner._resolve_profile_home_for_source = lambda source: tmp_path
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda **kwargs: {"model": {"default": "gpt-5.4", "provider": "openai-codex"}})
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
 
     response = await runner._handle_fast_command(_make_event("/fast fast --global"))
 
-    assert "FAST" in response
-    assert runner._service_tier == "priority"
+    assert "Global default saved" in response
+    assert "priority" in response
+    assert runner._resolve_session_service_tier(source=_make_source()) == "priority"
 
     saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
     assert saved["agent"]["service_tier"] == "fast"
     # Global write supersedes the session override.
-    assert not runner._session_service_tier_overrides
+    assert runner.session_store.get_runtime_settings(runner._session_key_for_source(_make_source()))["service_tier"] == "priority"
+    db.close()
 
 
 @pytest.mark.asyncio
@@ -154,7 +172,7 @@ async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path)
     runner = _make_runner()
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda **kwargs: {})
     monkeypatch.setattr(
         gateway_run,
         "_load_gateway_runtime_config",
@@ -162,12 +180,21 @@ async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path)
     )
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
 
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+    from hermes_state import SessionDB
+    runner.session_store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    db = SessionDB(db_path=tmp_path / "state.db")
+    runner.session_store._db_pinned = db
+    runner.config = GatewayConfig()
+    runner._normalize_source_for_session_key = lambda source: source
+    runner._resolve_profile_home_for_source = lambda source: tmp_path
     event = _make_event("/fast normal")
     session_key = runner._session_key_for_source(event.source)
 
     response = await runner._handle_fast_command(event)
 
-    assert "NORMAL" in response
+    assert "normal" in response.lower()
     # Override stores explicit None (normal) and wins over config "fast".
     assert session_key in runner._session_service_tier_overrides
     assert runner._resolve_session_service_tier(session_key=session_key) is None

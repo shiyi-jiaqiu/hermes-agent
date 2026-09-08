@@ -105,45 +105,29 @@ def _cfgset_guarded(fn):
 
 @_cfgset_guarded
 def _set_model(rid, params, key, value, session):
-    """Live/deferred model switch; see _apply_model_switch and _apply_pending_model_switch."""
+    """Parse UI flags; the shared settings operation commits an idle session selection."""
     if not value:
         return _err(rid, 4002, "model value required")
     confirmed = bool(params.get("confirm_expensive_model", False))
-    if session:
-        from hermes_cli.model_switch import parse_model_switch_args
-        sid = params.get("session_id", "")
-        parsed_flags = parse_model_switch_args(value)
-        if session.get("running"):
-            return _stash_pending_model_switch(rid, key, value, session, confirmed, parsed_flags)
-        explicit_provider = parsed_flags.explicit_provider
-        failed_agent_init = session.get("agent") is None and session.get("agent_error") is not None
-        failed_ready = session.get("agent_ready") if failed_agent_init else None
-        if failed_agent_init:
-            if failed_ready is None:
-                return _err(rid, 5032, session.get("agent_error") or "agent initialization failed")
-            if not failed_ready.wait(timeout=30.0):
-                return _err(rid, 5032, "agent initialization timed out")
-        failed_agent_init = (
-            failed_agent_init and session.get("agent") is None and session.get("agent_error") is not None
-            and session.get("agent_ready") is failed_ready and failed_ready.is_set())
-        if session.get("agent") is None and not explicit_provider.strip() and not failed_agent_init:
-            _start_agent_build(sid, session)
-            if init_err := _cfgset_await_agent(session, rid):
-                return init_err
-        with _session_profile_runtime_scope(session):
-            result = _apply_model_switch(sid, session, value, confirm_expensive_model=confirmed,
-                                         parsed_flags=parsed_flags)
-        if failed_agent_init and not result.get("confirm_required"):
-            _restart_completed_failed_agent_build(sid, session, failed_ready)
-            if init_err := _cfgset_await_agent(session, rid):
-                return init_err
-            with _session_profile_runtime_scope(session):
-                _persist_live_session_runtime(session)
-    else:
-        result = _apply_model_switch("", {"agent": None}, value, confirm_expensive_model=confirmed)
+    from hermes_cli.model_switch import parse_model_switch_args
+    flags = parse_model_switch_args(value)
+    if flags.errors:
+        return _err(rid, 4002, flags.error_messages()[0])
+    sid = params.get("session_id", "")
+    if session and session.get("running"):
+        return _stash_pending_model_switch(rid, key, value, session, confirmed, flags)
+    if session and flags.is_once:
+        _start_agent_build(sid, session)
+        if error := _cfgset_await_agent(session, rid):
+            return error
+    with _session_profile_runtime_scope(session or {}):
+        result = _apply_model_switch(sid, session if session is not None else {"agent": None}, value,
+                                     confirm_expensive_model=confirmed, parsed_flags=flags,
+                                     persist_override=True if session is None else None)
     return _kv(rid, key, result["value"], warning=result["warning"],
                confirm_required=result.get("confirm_required", False),
-               confirm_message=result.get("confirm_message", ""), scope=result.get("scope", "session"))
+               confirm_message=result.get("confirm_message", ""), scope=result.get("scope", "session"),
+               deferred=result.get("deferred", False))
 
 
 _FAST_WORDS = {"fast": "fast", "on": "fast", "normal": "normal", "off": "normal",
@@ -164,33 +148,23 @@ def _set_fast(rid, params, key, value, session):
     nv = _FAST_WORDS.get(raw, ("normal" if current_tier == "priority" else "fast") if raw in {"", "toggle"} else None)
     if nv is None:
         return _err(rid, 4002, f"unknown fast mode: {value}")
-    overrides = None
+    if session is not None and _word(params.get("scope")) != "global":
+        from hermes_cli.runtime_settings import SettingsRequest
+        with _session_profile_runtime_scope(session):
+            applied = _apply_session_settings(params["session_id"], session, SettingsRequest(service_tier=nv), _load_cfg())
+        return _kv(rid, key, nv) if applied.applied else _err(rid, 4002, applied.error)
     if nv == "fast":
         from hermes_cli.models import resolve_fast_mode_overrides
-        if agent is not None:
-            target_model = getattr(agent, "model", None)
-        else:  # a pre-build session may carry a picked model (desktop draft): validate against THAT
-            session_override = (session or {}).get("model_override") or {}
-            target_model = (isinstance(session_override, dict) and session_override.get("model")) or _resolve_model()
-        if not target_model:
-            return _err(rid, 4002, "fast mode is not available without a selected model")
-        overrides = resolve_fast_mode_overrides(target_model, provider=getattr(agent, "provider", None),
-                                                base_url=getattr(agent, "base_url", None))
-        if overrides is None:
+        target_model = _resolve_model()
+        if not target_model or resolve_fast_mode_overrides(target_model) is None:
             return _err(rid, 4002, "fast mode is not available for this model")
+    _write_config_key("agent.service_tier", nv)
     if session is not None:
-        # Session-scoped like `reasoning` (global = `--global` / Settings → Model): writing config.yaml
-        # here flipped fast mode for every surface. The create override survives rebuilds; "" pins normal.
-        session["create_service_tier_override"] = {"fast": "priority", "normal": ""}.get(nv, nv)
-    else:
-        _write_config_key("agent.service_tier", nv)
-    if agent is not None:
-        agent.service_tier = {"fast": "priority", "normal": None}.get(nv, nv)
-        current_overrides = {k: v for k, v in (getattr(agent, "request_overrides", {}) or {}).items()
-                             if k not in ("service_tier", "speed")}
-        agent.request_overrides = {**current_overrides, **(overrides or {})}
-        _persist_live_session_runtime(session)
-        _emit_session_info(params.get("session_id", ""), session)
+        from hermes_cli.runtime_settings import SettingsRequest
+        with _session_profile_runtime_scope(session):
+            applied = _apply_session_settings(params["session_id"], session, SettingsRequest(service_tier=nv), _load_cfg())
+        if not applied.applied:
+            return _err(rid, 4002, "Global default saved, but current session was not updated: " + applied.error)
     return _kv(rid, key, nv)
 
 
@@ -299,21 +273,20 @@ def _set_reasoning(rid, params, key, value, session):
     parsed = parse_reasoning_effort(arg)
     if parsed is None:
         return _err(rid, 4002, f"unknown reasoning value: {value}")
-    if scope == "global" or session is None:
-        _write_config_key("agent.reasoning_effort", arg)
-        if session is not None:
-            # /new is a full conversation boundary: session-scoped runtime overrides (/model, /reasoning,
-            # /fast) do NOT carry forward — the fresh agent re-derives model/provider, reasoning, and
-            # service tier from config.yaml (#48055, #23131). Session pins are cleared below so a rebuild
-            # can't resurrect them. (Global process state is still never touched — see the
-            # cross-session-contamination note in _apply_model_switch.)
-            session.pop("create_reasoning_override", None)
-    else:  # session-scoped like the gateway's `/reasoning <level>`; a menu pick must not rewrite the global
-        session["create_reasoning_override"] = parsed
-    if session and session.get("agent") is not None:
-        session["agent"].reasoning_config = parsed
-        _persist_live_session_runtime(session)
-        _emit_session_info(params.get("session_id", ""), session)
+    if scope != "global" and session is not None:
+        from hermes_cli.runtime_settings import SettingsRequest
+        with _session_profile_runtime_scope(session):
+            applied = _apply_session_settings(params["session_id"], session, SettingsRequest(reasoning=arg), _load_cfg())
+        return _kv(rid, key, arg) if applied.applied else _err(rid, 4002, applied.error)
+    _write_config_key("agent.reasoning_effort", arg)
+    if session is not None:
+        from hermes_cli.runtime_settings import SettingsRequest
+        with _session_profile_runtime_scope(session):
+            cfg = _load_cfg()
+            cfg["agent"] = {**cfg.get("agent", {}), "reasoning_effort": arg}
+            applied = _apply_session_settings(params["session_id"], session, SettingsRequest(reset_reasoning=True), cfg)
+        if not applied.applied:
+            return _err(rid, 4002, "Global default saved, but current session was not updated: " + applied.error)
     return _kv(rid, key, arg)
 
 

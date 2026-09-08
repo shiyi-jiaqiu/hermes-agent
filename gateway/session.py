@@ -446,8 +446,8 @@ def build_session_context_prompt(context: SessionContext, *, redact_pii: bool = 
     return "\n".join(lines)
 
 
-# /model override keys safe to persist; ``api_key``/``api_mode`` must NEVER reach sessions.json.
-PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
+# Route identity is persistable; credentials remain process-local.
+PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url", "api_mode")
 
 
 def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
@@ -1052,6 +1052,30 @@ class SessionStore(
         (#85709), and a background write must not make an idle session look fresh.
         """
         return self._update_entry(session_key, lambda e: e.metadata.__setitem__(key, value))
+
+    def set_runtime_settings(self, session_key: str, settings: dict, *, session_id: str) -> None:
+        """Commit in the owning session DB before publishing the in-memory route."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None or entry.session_id != session_id:
+                raise ValueError("Session changed during settings resolution")
+            db = self._db_for_key(session_key)
+            if db is None:
+                raise RuntimeError("Session database is unavailable")
+            db.update_runtime_settings(session_id, settings)
+            entry.was_auto_reset = False
+            entry.model_override = {
+                key: settings[key] for key in ("model", "provider", "base_url", "api_mode")}
+
+    def get_runtime_settings(self, session_key: str) -> Optional[dict]:
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None:
+                return None
+            db = self._db_for_key(session_key)
+            if db is None:
+                return None
+            return db.get_runtime_settings(entry.session_id)
 
     def set_model_override(self, session_key: str, override: Optional[Dict[str, Any]]) -> None:
         """Persist (or clear, with ``None``) the /model override; non-secret keys only."""

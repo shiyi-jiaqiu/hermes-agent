@@ -41,6 +41,7 @@ def _mock_event_dispatcher_builder(mock_handler_class):
     mock_builder.register_p2_im_message_reaction_created_v1 = Mock(return_value=mock_builder)
     mock_builder.register_p2_im_message_reaction_deleted_v1 = Mock(return_value=mock_builder)
     mock_builder.register_p2_card_action_trigger = Mock(return_value=mock_builder)
+    mock_builder.register_p2_application_bot_menu_v6 = Mock(return_value=mock_builder)
     mock_builder.build = Mock(return_value=object())
     mock_handler_class.builder = Mock(return_value=mock_builder)
     return mock_builder
@@ -236,6 +237,11 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         # group @mention message delivery over WebSocket.
         mock_ws_client.assert_called_once()
         call_kwargs = mock_ws_client.call_args.kwargs
+        self.assertEqual(
+            call_kwargs["log_level"],
+            "WARNING",
+            "Feishu WS INFO logs include credential-bearing connection URLs",
+        )
         self.assertIn("extra_ua_tags", call_kwargs,
                       "FeishuWSClient must receive extra_ua_tags for group @mention delivery")
         self.assertEqual(call_kwargs["extra_ua_tags"], ["channel"],
@@ -393,6 +399,10 @@ class TestAdapterBehavior(unittest.TestCase):
                 calls.append("reaction_deleted")
                 return self
 
+            def register_p2_application_bot_menu_v6(self, _handler):
+                calls.append("bot_menu")
+                return self
+
             def register_p2_card_action_trigger(self, _handler):
                 calls.append("card_action")
                 return self
@@ -440,6 +450,7 @@ class TestAdapterBehavior(unittest.TestCase):
                 "reaction_created",
                 "reaction_deleted",
                 "card_action",
+                "bot_menu",
                 "bot_added",
                 "bot_deleted",
                 "p2p_chat_entered",
@@ -1689,27 +1700,29 @@ class TestDedupTTL(unittest.TestCase):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
-        adapter = FeishuAdapter(PlatformConfig())
-        writes = []
-        calls = [0]
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"HERMES_HOME": tmp}, clear=True):
+                adapter = FeishuAdapter(PlatformConfig())
+                writes = []
+                calls = [0]
 
-        def slow_first_write(path, data, *args, **kwargs):
-            idx = calls[0]
-            calls[0] += 1
-            if idx == 0:
-                time.sleep(0.05)
-            writes.append(sorted(data["message_ids"]))
+                def slow_first_write(path, data, *args, **kwargs):
+                    idx = calls[0]
+                    calls[0] += 1
+                    if idx == 0:
+                        time.sleep(0.05)
+                    writes.append(sorted(data["message_ids"]))
 
-        async def run():
-            first = asyncio.create_task(adapter._is_duplicate("om_a"))
-            await asyncio.sleep(0.005)
-            second = asyncio.create_task(adapter._is_duplicate("om_b"))
-            await asyncio.gather(first, second)
+                async def run():
+                    first = asyncio.create_task(adapter._is_duplicate("om_a"))
+                    await asyncio.sleep(0.005)
+                    second = asyncio.create_task(adapter._is_duplicate("om_b"))
+                    await asyncio.gather(first, second)
 
-        with patch("plugins.platforms.feishu.adapter.atomic_json_write", side_effect=slow_first_write):
-            asyncio.run(run())
+                with patch("plugins.platforms.feishu.adapter.atomic_json_write", side_effect=slow_first_write):
+                    asyncio.run(run())
 
-        self.assertEqual(writes[-1], ["om_a", "om_b"])
+                self.assertEqual(writes[-1], ["om_a", "om_b"])
 
 
 class TestGroupMentionAtAll(unittest.TestCase):
@@ -2520,5 +2533,4 @@ class TestChatLockEviction(unittest.TestCase):
 
         adapter = self._make_adapter()
         self.assertIsInstance(adapter._chat_locks, _collections.OrderedDict)
-
 

@@ -74,17 +74,22 @@ class GatewayTurnMixin:
             override_runtime["capabilities"] = dict(override_runtime["capabilities"] or {})
             if override_runtime.get("api_key"):
                 if override_runtime.get("credential_pool") is None:
-                    override_runtime["credential_pool"] = _credential_pool_for_provider(override.get("provider"))
+                    override_runtime["credential_pool"] = _credential_pool_for_provider(
+                        override.get("provider"), base_url=override.get("base_url"), model=override_model)
                 logger.debug(
                     "Session model override (fast): session=%s config_model=%s -> override_model=%s provider=%s",
                     skey or "", model, override_model, override_runtime.get("provider"),
                 )
                 return override_model, override_runtime
-            # No api_key on the override: env-based resolution below, override model/provider on top.
-            logger.debug(
-                "Session model override (no api_key, fallback): session=%s config_model=%s override_model=%s",
-                skey or "", model, override_model,
-            )
+            # Resolve the override's own origin. The ambient provider's credential must
+            # never be layered onto a restored endpoint that could not resolve its key.
+            runtime = _resolve_runtime_agent_kwargs_for_provider(
+                override.get("provider") or "", base_url=override.get("base_url") or None,
+                model=override_model)
+            for key in ("provider", "requested_provider", "base_url", "api_mode", "request_overrides", "capabilities"):
+                if override.get(key):
+                    runtime[key] = override[key]
+            return override_model, runtime
         else:
             logger.debug(
                 "No session model override: session=%s config_model=%s override_keys=%s",
@@ -2730,6 +2735,9 @@ class GatewayTurnMixin:
             _voice_ack_guild=_voice_ack_guild, _voice_ack_loop=asyncio.get_running_loop(),
             **{name: getattr(disp, name) for name in self._DISPLAY_TO_TURN_CTX}, **turn_params,
         )
+        progress_adapter = self._adapter_for_source(source)
+        if disp.tool_progress_enabled and progress_adapter is not None:
+            turn_ctx.native_progress = progress_adapter.create_tool_progress(source, disp.user_config)
         turn_runner = TurnRunner(self, turn_ctx)
         # Agent tool-lifecycle callbacks live on the runner (bound methods, same signatures).
         turn_ctx.progress_callback = turn_runner.progress_callback
@@ -3501,6 +3509,16 @@ class GatewayTurnMixin:
     ) -> None:
         """``finally`` half of a turn: cancel background tasks, flush stream, release the session slot."""
         stream_consumer_holder, session_key = turn_ctx.stream_consumer_holder, turn_ctx.session_key
+        if turn_ctx.native_progress is not None and progress_task is not None:
+            outcome = turn_ctx.progress_outcome
+            turn_ctx.native_progress.finish(turn_ctx.progress_queue, outcome)
+            try:
+                await asyncio.wait_for(asyncio.shield(progress_task), timeout=5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                progress_task.cancel()
+                await asyncio.gather(progress_task, return_exceptions=True)
+            except Exception:
+                logger.exception("Native progress finalization failed")
         for task in (progress_task, log_task, interrupt_monitor, _notify_task):
             if task:
                 task.cancel()
@@ -3832,6 +3850,10 @@ class GatewayTurnMixin:
 
             # Interrupted OR queued message (/queue)?
             result = turn_ctx.result_holder[0]
+            turn_ctx.progress_outcome = ("interrupted" if result.get("interrupted") else
+                                         "failed" if result.get("failed") or result.get("error") else "finished")
+            if turn_ctx.native_progress is not None:
+                turn_ctx.native_progress.finish(turn_ctx.progress_queue, turn_ctx.progress_outcome)
             adapter = self._adapter_for_source(source)
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)

@@ -1501,7 +1501,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
             "model": model, "provider": provider or None, "base_url": base_url or None, "api_mode": api_mode or None}
     if provider:
         overrides["provider_override"] = provider
-    if isinstance(reasoning_config, dict):
+    if isinstance(reasoning_config, dict) and not model_config.get("reasoning_inherited"):
         overrides["reasoning_config_override"] = reasoning_config
     if service_tier:  # None = "inherit the profile" at _make_agent; "" = real override "no priority tier"
         overrides["service_tier_override"] = "" if service_tier.lower() == "normal" else service_tier
@@ -2103,6 +2103,19 @@ def _session_info(agent, session: dict | None = None) -> dict:
         info["update_command"] = recommended_update_command()
     if live_agent and (warn := _probe_credentials(agent)):
         info["credential_warning"] = warn
+    if agent is None and sess.get("model_override"):
+        route = sess["model_override"]
+        if isinstance(route, dict):
+            info.update(model=route.get("model", ""), provider=route.get("provider", ""))
+        from hermes_cli.runtime_settings import reasoning_name
+        rc = sess.get("create_reasoning_override")
+        if rc is None:
+            from hermes_constants import resolve_reasoning_config
+            with _session_profile_runtime_scope(sess):
+                rc = resolve_reasoning_config(_load_cfg(), info.get("model", ""))
+        info["reasoning_effort"] = reasoning_name(rc)
+        tier = sess.get("create_service_tier_override") or "normal"
+        info.update(service_tier=tier, fast=tier == "priority")
     return info
 
 
@@ -2216,8 +2229,10 @@ def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str
             if override_base_url:
                 # Failing identity recovery, still hand base_url to the direct-alias branch so pool/env credentials resolve.
                 resolve_kwargs["explicit_base_url"] = override_base_url
+        if override_base_url:
+            resolve_kwargs["explicit_base_url"] = override_base_url
         resolve_kwargs.update(requested=requested_provider, target_model=model or None)
-        overrides = {k: model_override.get(k) for k in ("base_url", "api_key", "api_mode")}
+        overrides = {k: model_override.get(k) for k in ("base_url", "api_key", "api_mode", "request_overrides", "capabilities")}
     else:
         model, requested_provider = _resolve_startup_runtime()
         if isinstance(model_override, str) and model_override:
@@ -2283,6 +2298,7 @@ def _make_agent(
         base_url=runtime.get("base_url"), api_key=runtime.get("api_key"), api_mode=runtime.get("api_mode"),
         acp_command=runtime.get("command"), acp_args=runtime.get("args"),
         credential_pool=runtime.get("credential_pool"), quiet_mode=True,
+        request_overrides=runtime.get("request_overrides"), capabilities=runtime.get("capabilities"),
         verbose_logging=False,  # DEBUG agent logging; independent of tool_progress_mode
         reasoning_config=(
             reasoning_config_override if reasoning_config_override is not None else _load_reasoning_config(str(model or ""))),
@@ -3209,7 +3225,7 @@ from . import (  # noqa: E402
     session_lifecycle as _session_lifecycle, session_reaper as _session_reaper,
     methods_browser_control as _methods_browser_control, methods_bot_relay as _methods_bot_relay,
     methods_complete as _methods_complete, methods_config as _methods_config,
-    methods_config_set as _methods_config_set, methods_images as _methods_images,
+    methods_config_set as _methods_config_set, methods_settings as _methods_settings, methods_images as _methods_images,
     methods_profiles as _methods_profiles, methods_prompt as _methods_prompt, methods_session as _methods_session,
     methods_tools as _methods_tools, prompt_turn as _prompt_turn, billing_view as _billing_view,
     methods_projects as _methods_projects)
@@ -3220,7 +3236,7 @@ for _m in (
     _prompt_attachments, _session_history, _agent_callbacks, _session_auto_continue,
     _methods_complete_helpers, _methods_slash, _methods_voice, _methods_browser,
     _methods_browser_control, _methods_session, _methods_prompt, _methods_config,
-    _methods_config_set, _methods_complete, _methods_tools, _methods_profiles, _methods_images,
+    _methods_config_set, _methods_settings, _methods_complete, _methods_tools, _methods_profiles, _methods_images,
     _methods_bot_relay, _prompt_turn, _billing_view, _methods_projects):
     _m.register(sys.modules[__name__])
 del _m

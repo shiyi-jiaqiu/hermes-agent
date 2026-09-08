@@ -310,6 +310,8 @@ class FeishuAdapterSettings:
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
     allow_all_dm: bool = False  # resolved per-profile so multiplexed adapters honor their own .env
+    menu_default_chat_id: str = ""
+    menu_routes: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -1110,7 +1112,8 @@ def _load_lark_oapi() -> bool:
             for module_name, names in _LARK_SDK_IMPORTS:
                 module = importlib.import_module(module_name)
                 bound.update({name: getattr(module, name) for name in names})
-            bound["FeishuWSClient"] = importlib.import_module("lark_oapi.ws").Client
+            bound["FeishuWSClient"] = importlib.import_module(
+                ".adapter_websocket", __package__).FeishuCardClient
         except (ImportError, AttributeError):
             return False
         bound["FEISHU_AVAILABLE"] = True
@@ -1191,7 +1194,10 @@ def _sdk_build(request_cls: Any, **fields: Any) -> Any:
     return builder.build()
 
 
-class FeishuAdapter(BasePlatformAdapter):
+from .adapter_cards import FeishuCardsMixin
+
+
+class FeishuAdapter(FeishuCardsMixin, BasePlatformAdapter):
     """Feishu/Lark bot adapter."""
 
     supports_code_blocks = True  # Feishu renders fenced code blocks
@@ -1227,6 +1233,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._sender_name_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (name, expire_at)
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
+        self._panel_controller = None
         self._card_action_tokens: Dict[str, float] = {}  # token → first_seen_time
         # Inbound events that arrived before the loop was ready; one drainer thread replays them.
         self._pending_inbound_events: List[Any] = []
@@ -1324,6 +1331,9 @@ class FeishuAdapter(BasePlatformAdapter):
             admins=frozenset(_id_set(extra.get("admins", []))),
             default_group_policy=str(extra.get("default_group_policy", "")).strip().lower(),
             group_rules=group_rules, allow_bots=allow_bots, allow_all_dm=allow_all_dm,
+            menu_default_chat_id=str(extra.get("menu_default_chat_id") or "").strip(),
+            menu_routes={str(k): str(v) for k, v in (extra.get("menu_routes") or {}).items()
+                         if str(v).startswith("/")},
             require_mention=_to_boolean(extra.get("require_mention", _get_scoped_secret("FEISHU_REQUIRE_MENTION", "true"))),
         )
 
@@ -1345,6 +1355,7 @@ class FeishuAdapter(BasePlatformAdapter):
             .register_p2_im_message_reaction_created_v1(lambda d: self._on_reaction_event("im.message.reaction.created_v1", d))
             .register_p2_im_message_reaction_deleted_v1(lambda d: self._on_reaction_event("im.message.reaction.deleted_v1", d))
             .register_p2_card_action_trigger(self._on_card_action_trigger)
+            .register_p2_application_bot_menu_v6(self._on_bot_menu_event)
             .register_p2_im_chat_member_bot_added_v1(self._on_bot_added_to_chat)
             .register_p2_im_chat_member_bot_deleted_v1(self._on_bot_removed_from_chat)
             .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(self._on_p2p_chat_entered)
@@ -1449,6 +1460,9 @@ class FeishuAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Feishu/Lark."""
         self._running = False
+        if self._panel_controller is not None:
+            await self._panel_controller.close()
+            self._panel_controller = None
         if self._ws_supervisor is not None:
             self._ws_supervisor.cancel()
             self._ws_supervisor = None
@@ -2073,7 +2087,18 @@ class FeishuAdapter(BasePlatformAdapter):
             return self._card_response()
         event = getattr(data, "event", None)
         action = getattr(event, "action", None)
-        action_value = getattr(action, "value", {}) or {}
+        from .panel.actions import normalize_mapping
+        from .panel.controller import PanelCallbackResult
+        action_value = normalize_mapping(getattr(action, "value", {}) or {})
+        if isinstance(action_value, dict) and action_value.get("panel_action"):
+            operator = getattr(event, "operator", None)
+            nested_id = getattr(operator, "operator_id", None)
+            open_id = str(getattr(operator, "open_id", "") or getattr(nested_id, "open_id", "") or "")
+            chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
+            result = (self._panel_controller.handle_sync(action_value, open_id=open_id, chat_id=chat_id, loop=loop)
+                      if self._panel_controller is not None
+                      else PanelCallbackResult("面板已失效，请重新打开 /panel", "warning"))
+            return self._build_panel_callback_response(result)
         if isinstance(action_value, dict):
             if action_value.get("hermes_action"):
                 return self._handle_approval_card_action(event=event, action_value=action_value, loop=loop)
@@ -2740,7 +2765,9 @@ class FeishuAdapter(BasePlatformAdapter):
             if handler is None:
                 logger.debug("[Feishu] Ignoring webhook event type: %s", event_type or "unknown")
             else:
-                getattr(self, handler)(data)
+                response = getattr(self, handler)(data)
+                if event_type == "card.action.trigger":
+                    return web.json_response(self._serialize_card_action_response(response))
         return web.json_response({"code": 0, "msg": "ok"})
 
     # Webhook event_type -> handler method name (reaction events are routed separately).
@@ -2750,6 +2777,7 @@ class FeishuAdapter(BasePlatformAdapter):
         "im.chat.member.bot.added_v1": "_on_bot_added_to_chat",
         "im.chat.member.bot.deleted_v1": "_on_bot_removed_from_chat",
         "card.action.trigger": "_on_card_action_trigger",
+        "application.bot.menu_v6": "_on_bot_menu_event",
         "drive.notice.comment_add_v1": "_on_drive_comment_event",
         "vc.bot.meeting_invited_v1": "_on_meeting_invited_event",
     }
@@ -3709,7 +3737,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_client = FeishuWSClient(
             app_id=self._app_id,
             app_secret=self._app_secret,
-            log_level=lark.LogLevel.INFO,
+            log_level=lark.LogLevel.WARNING,
             event_handler=self._event_handler,
             domain=domain,
             # Without the "channel" UA tag Feishu won't push group @mention events over WS.
@@ -3748,6 +3776,9 @@ class FeishuAdapter(BasePlatformAdapter):
     ) -> Any:
         last_error: Optional[Exception] = None
         active_reply_to = reply_to
+        if not active_reply_to and metadata and metadata.get("thread_id"):
+            active_reply_to = metadata.get("reply_to_message_id") or await self._fetch_last_message_in_thread(
+                str(metadata["thread_id"]))
 
         async def _raw(reply_target: Optional[str]) -> Any:
             return await self._send_raw_message(

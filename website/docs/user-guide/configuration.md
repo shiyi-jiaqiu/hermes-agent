@@ -880,6 +880,7 @@ compression:
   progress_notices: false                           # Opt-in: deliver routine compression progress notices to chat platforms — see below
   threshold: 0.50                                   # Compress at this % of context limit
   threshold_tokens: null                            # Absolute token cap (optional) — takes lower of ratio vs absolute
+  model_threshold_tokens: {}                       # Model substring → absolute cap; longest matching key wins
   target_ratio: 0.20                                # Fraction of threshold to preserve as recent tail
   tail_mode: lean                                   # Tail retention: "lean" (default — clamped 2.5% tail, 10K-25K, with a detailed session log + anchor index + session_search recovery pointers in the summary, all from ONE auxiliary summarizer call; ~3x fewer retained tokens after compaction) or "legacy" (0.20×threshold verbatim tail)
   protect_last_n: 20                                # Min recent messages to keep uncompressed
@@ -931,7 +932,7 @@ The value is the **first rung** of an escalating ladder, not a fixed interval: c
 
 `in_place` (default `true`) controls what happens to the session identity when compaction fires. When `true`, compaction rewrites the message list and rebuilds the system prompt **without rotating the session id** — the conversation keeps one durable id for its whole life (no `parent_session_id` chain, no `name #2` / `#3` renumbering in session lists). Compaction is non-destructive: the live context is compacted, but the pre-compaction turns are soft-archived under the same id (marked inactive/compacted) — still searchable via `session_search` and recoverable, not deleted. Hooks see the mode via the `in_place` field on the `session:compress` event. Set `in_place: false` to restore the legacy behavior where each compaction rotates to a new session id linked to the old one.
 
-`threshold_tokens` sets an optional **absolute token cap** for the compression trigger. When set, compression fires at the lower of the ratio-based `threshold` and this absolute count — so compression never fires later than the user's preferred token number regardless of which model is active. This solves the problem where switching between models with different context windows (e.g. 1M → 400K) shifts the absolute trigger point. The cap is clamped to the model's context length, so setting it higher than the model supports is safe — the ratio-based threshold is used instead. Default `null` (disabled — ratio-based threshold only). The cap survives model switches and fallback activations.
+`threshold_tokens` sets an optional **absolute token cap** for the compression trigger. When set, compression fires at the lower of the ratio-based `threshold` and this absolute count — so compression never fires later than the user's preferred token number regardless of which model is active. This solves the problem where switching between models with different context windows (e.g. 1M → 400K) shifts the absolute trigger point. The cap is clamped to the model's context length, so setting it higher than the model supports is safe — the ratio-based threshold is used instead. Default `null` (disabled — ratio-based threshold only). The cap survives model switches and fallback activations. `model_threshold_tokens` can override this cap per model (for example, `{"gemini": 120000, "gemini-3.8": 180000}`). The longest matching model substring wins. Missing or invalid entries use `threshold_tokens`; construction and model switches apply the same rule.
 
 `idle_compact_after_seconds` is an **opt-in, time-based** trigger that complements the size-based `threshold`. Default `0` (disabled). When set above 0, a session that resumes after at least that many seconds of inactivity compacts its accumulated history up front, before the first reply — so a long-lived thread (e.g. a Telegram conversation you come back to hours later) doesn't re-read its full stale context on every subsequent turn. It never fires when the context is already at or below the post-compression target (`threshold × target_ratio`), and it honors the same failure-cooldown, anti-thrash, and per-session lock guards as every automatic compaction. Example: `idle_compact_after_seconds: 1800` compacts after 30 minutes idle.
 
@@ -1928,6 +1929,15 @@ display:
   timestamps: false       # When true, prefixes user and assistant labels with timestamps in the CLI / TUI transcript
   timestamp_format: "%H:%M"  # strftime format for those timestamps (e.g. "%b-%d %H:%M" for month-day)
   tool_preview_length: 0  # Max chars for tool call previews (0 = no limit, show full paths/commands)
+  tool_progress_grouping: accumulate # Gateway: accumulate | separate
+  tool_progress_style: text          # text | card (native card currently supported by Feishu)
+  tool_edit_display: off             # off | summary | diff
+  tool_diff_visibility: private      # private | all (group chats get summary-only when private)
+  tool_diff_max_files: 6
+  tool_diff_max_lines: 80
+  tool_diff_max_chars: 6000
+  tool_progress_max_items: 4
+  tool_progress_card_max_chars: 7200
   turn_summary: true      # CLI only: print a one-line post-turn accounting footer after each interactive turn
   spinner_token_flow: true # CLI only: append live cumulative turn tokens to the spinner timer
   runtime_footer:         # Gateway: append a runtime-context footer to final replies

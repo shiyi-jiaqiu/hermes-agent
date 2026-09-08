@@ -2151,6 +2151,9 @@ class ContextCompressor(MicroCompactionMixin, ContextEngine):
         # A switch that genuinely changes the output budget passes the new value explicitly. (#43547)
         if max_tokens is not None:
             self.max_tokens = self._coerce_max_tokens(max_tokens)
+        self.threshold_tokens_cap = self._resolve_model_threshold_tokens_cap(
+            model, self.model_threshold_tokens, self._global_threshold_tokens_cap,
+        )
         self.threshold_tokens = self._compute_threshold_tokens(context_length, self.threshold_percent, self.max_tokens)
         self._apply_threshold_tokens_cap()
         # Reset to None so the property recomputes via the mode-aware path (not the legacy formula).
@@ -2198,8 +2201,40 @@ class ContextCompressor(MicroCompactionMixin, ContextEngine):
             return None
         return ivalue if ivalue > 0 else None
 
-    # Same normalization: a threshold_tokens cap is a positive int, or None for "no cap".
-    _coerce_threshold_tokens_cap = _coerce_max_tokens
+    @staticmethod
+    def _coerce_threshold_tokens_cap(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return parsed if parsed > 0 else None
+
+    @classmethod
+    def _resolve_model_threshold_tokens_cap(
+        cls,
+        model: str,
+        model_threshold_tokens: dict[str, int] | None,
+        default: Any,
+    ) -> int | None:
+        """Resolve a per-model absolute compression trigger cap.
+
+        Keys use the same longest-substring matching contract as
+        ``model_thresholds``. An absent/invalid match falls back to the global
+        ``compression.threshold_tokens`` value.
+        """
+        fallback = cls._coerce_threshold_tokens_cap(default)
+        if not model_threshold_tokens or not model:
+            return fallback
+        best_key = ""
+        for key in model_threshold_tokens:
+            key_text = str(key)
+            if key_text in model and len(key_text) > len(best_key):
+                best_key = key_text
+        if not best_key:
+            return fallback
+        return cls._coerce_threshold_tokens_cap(model_threshold_tokens[best_key]) or fallback
 
     def _apply_threshold_tokens_cap(self) -> None:
         """Clamp threshold_tokens to the configured cap (itself clamped to the context length)."""
@@ -2258,6 +2293,7 @@ class ContextCompressor(MicroCompactionMixin, ContextEngine):
         base_url: str = "", api_key: str = "", config_context_length: int | None = None, provider: str = "",
         api_mode: str = "", abort_on_summary_failure: bool = False, max_tokens: int | None = None,
         model_thresholds: dict[str, float] | None = None, threshold_tokens_cap: Any = None,
+        model_threshold_tokens: dict[str, int] | None = None,
         proactive_prune_tokens: int = 0, proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
     ):
@@ -2271,7 +2307,12 @@ class ContextCompressor(MicroCompactionMixin, ContextEngine):
         self._base_threshold_percent = resolve_model_threshold(model, self.model_thresholds, threshold_percent)
         self.threshold_percent = self._base_threshold_percent
         # Effective trigger = min(ratio threshold, cap); re-applied in update_model().
-        self.threshold_tokens_cap = self._coerce_threshold_tokens_cap(threshold_tokens_cap)
+        self.model_threshold_tokens = {str(key): self._coerce_threshold_tokens_cap(value)
+                                       for key, value in (model_threshold_tokens or {}).items() if str(key)}
+        self._global_threshold_tokens_cap = self._coerce_threshold_tokens_cap(threshold_tokens_cap)
+        self.threshold_tokens_cap = self._resolve_model_threshold_tokens_cap(
+            model, self.model_threshold_tokens, self._global_threshold_tokens_cap,
+        )
         self.protect_first_n, self.protect_last_n = protect_first_n, protect_last_n
         # Proactive prune runs independently of the full-compression trigger. 0 = disabled.
         self.proactive_prune_tokens = int(proactive_prune_tokens or 0)

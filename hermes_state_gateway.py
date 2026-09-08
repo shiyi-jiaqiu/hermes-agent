@@ -557,6 +557,8 @@ class SessionGatewayMixin:
                 raw = {}
         if not isinstance(raw, dict):
             raw = {}
+        if raw.get("settings_override"):
+            return {k: raw.get(k) for k in ("model", "provider", "base_url", "api_mode")}
         runtime = raw.get("gateway_runtime")
         # Filter None: the persist path writes or-None to trigger deletion in the top-level
         # merge, but gateway_runtime is replaced whole (not deep-merged), so None survives here.

@@ -11,6 +11,7 @@ import re
 from typing import Any, Callable, Optional
 
 from agent.reasoning_effort import (
+    gemini_supported_efforts,
     ACTUAL_RELAY_EFFORTS, XAI_GROK46_EFFORTS, XAI_LEGACY_EFFORTS, clamp_effort,
     # Same declared vocabulary + shared clamp as the main Codex transport (agent.reasoning_effort):
     # per-model — "max" is gpt-5.6-only, "minimal"/"ultra" always rejected (live-verified, #68365).
@@ -226,7 +227,7 @@ def _resolve_reasoning(model: str, params: dict[str, Any]) -> tuple[Any, bool]:
         declared = _profile_declared_efforts(params.get("provider"), model, params.get("base_url"))
         if declared is not None and not declared:
             reasoning_enabled = False
-        supported = declared or codex_supported_efforts(model)
+        supported = declared or gemini_supported_efforts(model) or codex_supported_efforts(model)
     return clamp_effort(reasoning_effort, supported), reasoning_enabled
 
 

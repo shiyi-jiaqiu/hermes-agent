@@ -71,7 +71,7 @@ def _reset_model_to_config_default(cli, silent: bool) -> None:
     else:
         _raw_default, _config_provider = (_model_config or ""), ""
     _config_model, _ = _split_model_config_default(_raw_default)
-    if not _config_model or _config_model == getattr(cli, "model", None):
+    if not _config_model:
         return
     try:
         from hermes_cli.model_switch import switch_model as _switch_model
@@ -96,12 +96,11 @@ def _reset_model_to_config_default(cli, silent: bool) -> None:
         cli.requested_provider = r.target_provider
         cli._explicit_api_key = r.api_key
         cli._explicit_base_url = r.base_url
-        if r.api_key:
-            cli.api_key = r.api_key
-        if r.base_url:
-            cli.base_url = r.base_url
-        if r.api_mode:
-            cli.api_mode = r.api_mode
+        cli.api_key = r.api_key or ""
+        cli.base_url = r.base_url or ""
+        cli.api_mode = cli._explicit_api_mode = r.api_mode or ""
+        cli._settings_request_overrides = r.request_overrides
+        cli._settings_capabilities = r.runtime_capabilities
         if not silent:
             _cprint(f"  (model reset to config default: {r.new_model})")
     except Exception:
@@ -527,7 +526,9 @@ class CLISessionMixin:
             self._discard_session_if_empty(old_session_id)
 
         self.session_start = datetime.now()
-        self.session_id = f"{self.session_start.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        from hermes_cli.settings_endpoint import runtime_settings_lock
+        with runtime_settings_lock(self):
+            self.session_id = f"{self.session_start.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
         # getattr: tests drive new_session unbound against a SimpleNamespace stand-in.
         getattr(self, "_write_terminal_breadcrumb", lambda: None)()
         self.conversation_history = []
@@ -535,6 +536,9 @@ class CLISessionMixin:
         self._resumed = False
         # An explicit -m/--model was for the previous session only.
         self._explicit_model_override = False
+        self._settings_reasoning_inherited = True
+        self._settings_request_overrides = self._settings_capabilities = None
+        self._explicit_api_mode = ""
         self.reasoning_config = _parse_reasoning_config(
             CLI_CONFIG["agent"].get("reasoning_effort", ""))
         # Session-scoped overrides (/model --session, /fast, one-turn restores) don't carry over.

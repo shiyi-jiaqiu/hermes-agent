@@ -69,7 +69,12 @@ class TestCLIQuickCommands:
         printed = self._printed_plain(cli.console.print.call_args[0][0])
         assert printed == "overridden"
 
-
+    def test_quick_mode_alias_dispatches_to_mode_handler(self):
+        cli = self._make_cli({})
+        cli._pending_resume_sessions = None
+        cli._handle_mode_command = MagicMock()
+        assert cli.process_command("/quick") is True
+        cli._handle_mode_command.assert_called_once_with("/quick")
 
 
 # ── Gateway tests ──────────────────────────────────────────────────────────

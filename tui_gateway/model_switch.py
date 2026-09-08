@@ -15,11 +15,10 @@ def _persist_model_switch(result) -> None:
     # Targeted key writes: a full `model:` block rewrite via save_config() would destroy
     # sibling keys the user set there (`model_slots`, `model_fallback`, ...).
     from cli import save_config_value
-    save_config_value("model.default", result.new_model)
-    save_config_value("model.provider", result.target_provider)
-    # A provider without a base_url must clear the stale one (custom endpoint -> native)
-    # or the new model routes at the old host; reads coalesce null to absent.
-    save_config_value("model.base_url", result.base_url or None)
+    for key, value in (("default", result.new_model), ("provider", result.target_provider),
+                       ("base_url", result.base_url or None), ("api_mode", result.api_mode or None)):
+        if not save_config_value("model." + key, value):
+            raise OSError("Global model configuration write failed")
 
 
 _RUNTIME_KEYS = ("model", "provider", "api_key", "base_url", "api_mode")
@@ -230,6 +229,21 @@ def _apply_model_switch(
         confirm = _expensive_model_confirm(result, current_base_url, current_api_key)
         if confirm is not None:
             return confirm
+    if not one_turn and pin_session_override and not session.get("running"):
+        from hermes_cli.runtime_settings import SettingsRequest
+        applied = _apply_session_settings(sid, session, SettingsRequest(result.new_model, result.target_provider),
+                                          cfg or {}, resolver=lambda **kwargs: result)
+        if not applied.applied:
+            raise ValueError(applied.error)
+        warning = result.warning_message or ""
+        if persist_global:
+            try:
+                _persist_model_switch(result)
+            except Exception:
+                logger.warning("Global model config write failed", exc_info=True)
+                warning = "Session settings saved, but the global configuration could not be fully written."
+        return {"value": applied.actual.model, "warning": warning,
+                "confirm_required": False, "scope": "global" if persist_global else "session", "deferred": True}
     if agent:
         _commit_agent_switch(sid, session, agent, result, current_model, restore_snapshot)
     # PER-SESSION override so a rebuild of THIS session (/new, resume) re-derives the model.

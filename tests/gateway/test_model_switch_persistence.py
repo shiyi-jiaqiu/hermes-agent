@@ -261,3 +261,18 @@ class TestOneTurnNeverPersisted:
         # ...but NEVER written through to the persistent session store.
         runner.async_session_store.set_model_override.assert_not_awaited()
 
+
+
+@pytest.mark.asyncio
+async def test_global_alias_route_is_written_to_explicit_profile_path(tmp_path):
+    import yaml
+    from hermes_cli.model_switch import ModelSwitchResult
+    from gateway.slash_commands_model import _persist_model_switch_to_config
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump({"model": {"default": "old", "api_key": "obsolete", "context_length": 100000},
+                                    "display": {"timestamps": True}}))
+    result = ModelSwitchResult(True, "gemini", "custom:cpa", base_url="https://alias.test/v1", api_mode="codex_responses")
+    await _persist_model_switch_to_config(result, path)
+    cfg = yaml.safe_load(path.read_text())
+    assert cfg["model"] == {"default": "gemini", "provider": "custom:cpa", "base_url": "https://alias.test/v1", "api_mode": "codex_responses"}
+    assert cfg["display"] == {"timestamps": True}

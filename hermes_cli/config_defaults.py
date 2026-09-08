@@ -856,6 +856,14 @@ DEFAULT_CONFIG = {
         # "separate" one message per tool (noisier). Needs tool_progress enabled. Per-platform:
         # display.platforms.<platform>.tool_progress_grouping.
         "tool_progress_grouping": "accumulate",
+        'tool_progress_style': 'text',
+        'tool_edit_display': 'off',
+        'tool_diff_visibility': 'private',
+        'tool_diff_max_files': 6,
+        'tool_diff_max_lines': 80,
+        'tool_diff_max_chars': 6000,
+        'tool_progress_max_items': 4,
+        'tool_progress_card_max_chars': 7200,
         # Custom long-running status phrases. Defaults: gateway/assets/status_phrases.yaml.
         # `path`/`paths` = HERMES_HOME-relative YAML files/dirs (or conventional status_phrases.yaml
         # / status_phrases/*.yaml). Keys: status, generic. mode: "append" (default) | "replace".

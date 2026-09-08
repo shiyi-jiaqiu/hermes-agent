@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
 from agent.reasoning_effort import (
+    gemini_supported_efforts,
     KIMI_K3_EFFORTS, KIMI_K3_OVERRIDES, OPENAI_COMPAT_WIRE_EFFORTS, TOKENHUB_EFFORTS, clamp_effort,
     kimi_supported_efforts, requested_effort,
 )
@@ -146,14 +147,11 @@ def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> 
         return thinking_config
     if effort not in {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
         effort = "medium"
-    # Gemini 3 Flash documents low/medium/high; Gemini 3 Pro only low/high.
-    if normalized_model.startswith(("gemini-3", "gemini-3.1")):
-        if "flash" in normalized_model:
-            thinking_config["thinkingLevel"] = (
-                "low" if effort in {"minimal", "low"} else "high" if effort in _HIGH_EFFORTS else "medium"
-            )
-        elif "pro" in normalized_model:
-            thinking_config["thinkingLevel"] = "high" if effort in _HIGH_EFFORTS else "low"
+    supported = gemini_supported_efforts(normalized_model)
+    if supported is not None:
+        wire_effort = clamp_effort(effort, supported)
+        if wire_effort:
+            thinking_config["thinkingLevel"] = wire_effort
     return thinking_config
 
 

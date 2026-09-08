@@ -275,6 +275,92 @@ Peer bots do not need to be added to `FEISHU_ALLOWED_USERS` — that allowlist a
 
 Grant the `application:bot.basic_info:read` scope to display peer bot names; without it, peer bots still route correctly but appear as their `open_id`.
 
+## Control Panel
+
+Run `/panel` (or `/panel model`, `/panel reasoning`, `/panel sessions`, `/panel status`)
+to open a private-to-the-operator set of controls in the current chat. Buttons obey
+Hermes sender authorization and the chat's group policy. Session listings are scoped
+to the current chat/thread/user lane; they do not expose other conversations.
+
+A panel is owned by one Gateway process. Restarting the Gateway expires old cards;
+run `/panel` again. Chat history and session settings remain in the normal session
+database. Opening another panel replaces the previous panel for that operator and
+chat/thread only.
+
+`/quick`, `/daily`, `/deep`, and `/mode <name> [fast|normal]` use configured presets.
+The Panel, Gateway commands, CLI, and TUI/Desktop share the same settings operation:
+the original model alias resolves its complete model/provider/endpoint/API route,
+then route, reasoning and service tier are saved together for the next turn. Stop a
+running turn before changing these settings. A failed session write leaves its
+previous settings in place. `--global` additionally writes the profile default;
+configuration and session writes are separate and any partial outcome is reported.
+
+```yaml
+mode_presets:
+  quick: {model: your-quick-alias, reasoning: high, fast_mode: false}
+  daily: {model: your-daily-alias, reasoning: high, fast_mode: false}
+  deep: {model: your-deep-alias, reasoning: max, fast_mode: false}
+feishu_panel:
+  hidden_providers: []
+  hidden_model_prefixes: {}
+```
+
+Define the model aliases for your providers first. Provider visibility is controlled
+by this profile's configuration. Model discovery is shared across panels for the
+same profile/configuration version; each panel derives its own current selection.
+
+For configurations from the old Panel implementation, run
+`python -m scripts.migrate_feishu_settings --config ~/.hermes/config.yaml` to preview
+the changed keys, then add `--apply`. The migration renames `mode_presets.fast` to
+`quick` when `quick` is absent and moves the old visibility policy into YAML. It
+preserves existing visibility lists, creates a backup, and is safe to repeat.
+
+## Coding Progress Cards
+
+Feishu can present tool execution as one editable interactive card with bounded,
+redacted terminal commands, ID-correlated completion state, duration/exit
+code, and bounded file-edit diffs. Cards use Feishu Card JSON 2.0 with one
+native Markdown component per tool: terminal commands render as `bash` code
+blocks, file changes as `diff` blocks, and search/read arguments as labeled
+fields rather than a semicolon-joined line. Feishu clients provide the code
+block styling, copy control, and supported syntax highlighting; no HTML or
+third-party renderer is required. This is opt-in:
+
+```yaml
+# ~/.hermes/config.yaml
+display:
+  tool_progress_command: true
+  interim_assistant_messages: true
+  show_commentary: true
+  platforms:
+    feishu:
+      tool_progress: all
+      tool_preview_length: 1000
+      tool_progress_grouping: accumulate
+      tool_progress_style: card       # text | card
+      tool_edit_display: diff         # off | summary | diff
+      tool_diff_visibility: private   # private | all
+      tool_diff_max_files: 6
+      tool_diff_max_lines: 80
+      tool_diff_max_chars: 6000
+      tool_progress_max_items: 4
+      tool_progress_card_max_chars: 7200
+```
+
+`patch` uses the unified diff already returned by the tool. For local
+`write_file` operations Hermes captures the pre-write state and derives the
+diff after completion. Diff text is force-redacted and bounded before it leaves
+the gateway. With `tool_diff_visibility: private` (the recommended default),
+group chats show file/addition/deletion summaries but not source lines.
+
+The card transport is presentation-only: it does not alter tool results,
+conversation history, prompts, or prompt caching. A card send/update failure stops
+progress display for that turn; tool execution and the final answer continue. The
+card stays Working between tools until the turn explicitly finishes; interrupted
+and failed turns have distinct terminal states. Only active calls, a bounded recent
+history, and cumulative counters are kept for display. These cards have no buttons, so they require no app permission or event subscription beyond
+normal message sending.
+
 ## Interactive Card Actions
 
 When users click buttons or interact with interactive cards sent by the bot, the adapter routes these as synthetic `/card` command events:

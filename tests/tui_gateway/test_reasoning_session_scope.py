@@ -60,18 +60,28 @@ class TestConfigSetReasoningSessionScope:
         handler = server._methods["config.set"]
         return handler("rid-1", params)
 
-    def test_session_scoped_set_skips_global_write(self) -> None:
+    def test_session_scoped_set_skips_global_write(self, tmp_path) -> None:
         agent = _agent(None)
-        session = {"session_key": "k1", "agent": agent}
+        import threading
+        from hermes_state import SessionDB
+        from contextlib import contextmanager
+        db = SessionDB(db_path=tmp_path / "state.db")
+        @contextmanager
+        def database(session):
+            yield db
+        session = {"session_key": "k1", "agent": agent, "history_lock": threading.Lock()}
         with patch.dict(server._sessions, {"s1": session}, clear=False), \
                 patch.object(server, "_write_config_key") as write_key, \
-                patch.object(server, "_persist_live_session_runtime"), \
+                patch.object(server, "_session_db", database), \
                 patch.object(server, "_emit"):
             resp = self._dispatch(
                 {"key": "reasoning", "session_id": "s1", "value": "none"}
             )
         assert resp["result"]["value"] == "none"
-        assert agent.reasoning_config == {"enabled": False}
+        assert session["create_reasoning_override"] == {"enabled": False}
+        assert session["agent"] is None
+        assert db.get_runtime_settings("k1")["reasoning"] == "none"
+        db.close()
         write_key.assert_not_called()
 
 

@@ -2601,6 +2601,18 @@ class CLICommandsMixin:
             arg, current, usage="/timestamps [on|off|status]", status_line="",
             config_key="display.timestamps", label="Message timestamps", failed="timestamps")
 
+    def _handle_mode_command(self, command: str):
+        from hermes_cli.config import load_config
+        from hermes_cli.runtime_settings import mode_request, parse_mode_command
+        from hermes_cli.settings_endpoint import apply_cli_settings
+        try:
+            name, modifier = parse_mode_command(command)
+            cfg = load_config()
+            result = apply_cli_settings(self, mode_request(cfg, name, modifier), cfg)
+            _cp(result.text())
+        except ValueError as exc:
+            _cp(str(exc))
+
     # ---- model-behaviour settings: /reasoning, /busy, /indicator, /fast -------------------
     def _handle_reasoning_command(self, cmd: str):
         """Handle /reasoning [<level> [--global]|show|hide|full|clamp] — effort level (session
@@ -2638,14 +2650,21 @@ class CLICommandsMixin:
                        _dim_line('Valid levels: none, minimal, low, medium, high, xhigh, max, ultra'),
                        _dim_line('Display:      show, hide'),
                        _dim_line('Scope:        session-scoped by default, --global to persist'))
-        self.reasoning_config = parsed
-        self.agent = None  # Force agent re-init with new reasoning config
-        saved = explicit_global and _save("agent.reasoning_effort", arg)
-        if saved:
-            if not isinstance(CLI_CONFIG.get("agent"), dict):
-                CLI_CONFIG["agent"] = {}
-            CLI_CONFIG["agent"]["reasoning_effort"] = arg
-        _cp(_accent_line(f"✓ Reasoning effort set to '{arg}' {_scope_outcome(explicit_global, saved)}"))
+        if not explicit_global:
+            from hermes_cli.config import load_config
+            from hermes_cli.runtime_settings import SettingsRequest
+            from hermes_cli.settings_endpoint import apply_cli_settings
+            return _cp(apply_cli_settings(self, SettingsRequest(reasoning=arg), load_config()).text())
+        if not _save("agent.reasoning_effort", arg):
+            return _cp("Configuration write failed; settings unchanged")
+        from hermes_cli.config import load_config
+        from hermes_cli.runtime_settings import SettingsRequest
+        from hermes_cli.settings_endpoint import apply_cli_settings
+        cfg = load_config()
+        cfg["agent"] = {**cfg.get("agent", {}), "reasoning_effort": arg}
+        CLI_CONFIG["agent"] = {**CLI_CONFIG.get("agent", {}), "reasoning_effort": arg}
+        result = apply_cli_settings(self, SettingsRequest(reset_reasoning=True), cfg)
+        _cp("Global default saved. " + result.text())
 
     def _handle_busy_command(self, cmd: str):
         """Handle /busy [status|queue|steer|interrupt] — what Enter does while Hermes is working."""
@@ -2695,11 +2714,19 @@ class CLICommandsMixin:
         arg, explicit_global = _split_scope_flags(raw)
         if arg not in _FAST_TIERS:
             return _cp(_dim_line(f'(._.) Unknown argument: {arg}'), usage)
-        self.service_tier, saved_value = _FAST_TIERS[arg]
-        self.agent = None  # Force agent re-init with new service-tier config
-        saved = explicit_global and _save("agent.service_tier", saved_value)
-        outcome = _scope_outcome(explicit_global, saved)
-        _cp(_accent_line(f"✓ {feature_name} set to {saved_value.upper()} {outcome}"))
+        if not explicit_global:
+            from hermes_cli.config import load_config
+            from hermes_cli.runtime_settings import SettingsRequest
+            from hermes_cli.settings_endpoint import apply_cli_settings
+            return _cp(apply_cli_settings(self, SettingsRequest(service_tier=arg), load_config()).text())
+        _, saved_value = _FAST_TIERS[arg]
+        if not _save("agent.service_tier", saved_value):
+            return _cp("Configuration write failed; settings unchanged")
+        from hermes_cli.config import load_config
+        from hermes_cli.runtime_settings import SettingsRequest
+        from hermes_cli.settings_endpoint import apply_cli_settings
+        result = apply_cli_settings(self, SettingsRequest(service_tier=arg), load_config())
+        _cp("Global default saved. " + result.text())
 
     # ---- /debug, /update, /voice, /wake ---------------------------------------------------
     def _handle_debug_command(self, cmd_original: str = ""):

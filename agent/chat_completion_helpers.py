@@ -352,6 +352,22 @@ def _is_openai_codex_backend(agent) -> bool:
     return classify_responses_route(agent).is_codex_backend
 
 
+def codex_event_stale_timeout_default(est_tokens: int) -> float:
+    """Default maximum gap between valid Codex SSE events.
+
+    GPT-5.6 streams can legitimately pause between events while reasoning or
+    while synchronous safeguards run.  A 12-second small-request default was
+    shorter than pauses observed in production and made Hermes close healthy
+    streams itself, which the worker then reported as ``Broken pipe``.  Keep a
+    60-second floor while retaining longer context-scaled windows.
+    """
+    if est_tokens > 100_000:
+        return 180.0
+    if est_tokens > 50_000:
+        return 120.0
+    return 60.0
+
+
 def openai_codex_stale_timeout_floor(est_tokens: int) -> float:
     """Minimum wall-clock stale timeout for openai-codex by estimated context:
     subscription-backed Codex can spend minutes in admission/prefill on
@@ -1042,9 +1058,7 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
         if hard_timeout > 0:
             stale_timeout = min(stale_timeout, hard_timeout)
 
-    idle_default = next(
-        (default for threshold, default in ((100_000, 180.0), (50_000, 120.0), (10_000, 60.0)) if est_tokens > threshold),
-        12.0)
+    idle_default = codex_event_stale_timeout_default(est_tokens)
 
     # No-byte TTFB cutoff. Default 120s: the SDK's own read timeout is 600s,
     # and a tight 12s killed subscription-backed requests mid-prefill.

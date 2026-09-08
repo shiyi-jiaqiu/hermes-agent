@@ -220,6 +220,45 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
     return fmt(sid, session, arg) if callable(fmt) else fmt
 
 
+def _format_live_mode_output(sid, session, arg):
+    response = _mode_apply("slash-mode", {"session_id": sid, "command": "/mode " + arg})
+    if "error" in response:
+        return response["error"]["message"]
+    return response["result"]["output"]
+
+
+_LIVE_SLASH_OUTPUT["mode"] = ("No active session", _format_live_mode_output)
+
+
+def _format_live_mode_alias(sid, session, name, arg):
+    return _format_live_mode_output(sid, session, name + " " + arg)
+
+
+for _mode_name in ("quick", "daily", "deep"):
+    _LIVE_SLASH_OUTPUT[_mode_name] = (
+        "No active session", lambda sid, session, arg, name=_mode_name: _format_live_mode_alias(sid, session, name, arg))
+
+
+def _format_live_tuning_output(sid, session, name, arg):
+    from hermes_cli.cli_commands_mixin import _split_scope_flags
+    value, global_scope = _split_scope_flags(arg)
+    if not value:
+        with _session_profile_runtime_scope(session):
+            actual = _TUISettingsEndpoint(sid, session).read()
+        return f"Reasoning: {actual.reasoning}" if name == "reasoning" else f"Service tier: {actual.service_tier}"
+    response = _methods["config.set"]("slash-settings", {
+        "session_id": sid, "key": name, "value": value,
+        "scope": "global" if global_scope else "session"})
+    if "error" in response:
+        return response["error"]["message"]
+    return f"{name}: {response['result']['value']}"
+
+
+for _tuning_name in ("reasoning", "fast"):
+    _LIVE_SLASH_OUTPUT[_tuning_name] = (
+        "No active session", lambda sid, session, arg, name=_tuning_name: _format_live_tuning_output(sid, session, name, arg))
+
+
 # ── Side-effect mirroring ────────────────────────────────────────────
 
 # Read-then-mutate live agent/session state that a running turn is using; rejected

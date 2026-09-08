@@ -48,6 +48,20 @@ class _StubCLI:
     _pending_model_switch_note = ""
 
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def session_database(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=tmp_path / "state.db")
+    for key, value in {"session_id": "settings", "_session_db": db,
+                       "reasoning_config": None, "service_tier": None}.items():
+        monkeypatch.setattr(_StubCLI, key, value, raising=False)
+    yield db
+    db.close()
+
+
 def _run_display(monkeypatch, result):
     import cli as cli_mod
 
@@ -133,7 +147,7 @@ def test_global_switch_clears_context_pin_owned_by_previous_route(monkeypatch):
     monkeypatch.setattr(
         cli_mod,
         "save_config_value",
-        lambda key, value: writes.append((key, value)),
+        lambda key, value: (writes.append((key, value)) or True),
     )
     cli = _StubCLI()
     cli.model = "shared-model"

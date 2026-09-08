@@ -15,6 +15,14 @@ from typing import Any
 _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
+    'tool_progress_style': 'text',
+    'tool_edit_display': 'off',
+    'tool_diff_visibility': 'private',
+    'tool_diff_max_files': 6,
+    'tool_diff_max_lines': 80,
+    'tool_diff_max_chars': 6000,
+    'tool_progress_max_items': 4,
+    'tool_progress_card_max_chars': 7200,
     "show_reasoning": False,
     "reasoning_style": "code",  # "code" (💭 **Reasoning:** + fence), "blockquote" ("> "), "subtext" ("-# " Discord)
     "tool_preview_length": 0,
@@ -147,6 +155,13 @@ def _norm_int(value: Any) -> int:
         return 0
 
 
+def _norm_budget(value: Any, default: int) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
 _NORMALISERS: dict[str, Any] = {
     "tool_progress": _norm_tristate("all", "off", {"off", "new", "all", "verbose", "log"}),
     "show_reasoning": _norm_bool,
@@ -160,6 +175,12 @@ _NORMALISERS: dict[str, Any] = {
     "live_status": _norm_tristate("full", "off", {"full", "verb", "off"}, extra_truthy={"all"}),
     "tool_progress_grouping": _norm_choice(("accumulate", "separate")),
     "reasoning_style": _norm_choice(("code", "blockquote", "subtext")),
+    "tool_progress_style": _norm_choice(("text", "card")),
+    "tool_edit_display": _norm_choice(("off", "summary", "diff")),
+    "tool_diff_visibility": _norm_choice(("private", "all")),
+    **{name: (lambda value, default=default: _norm_budget(value, default))
+       for name, default in _GLOBAL_DEFAULTS.items()
+       if name.startswith(("tool_diff_max_", "tool_progress_max_", "tool_progress_card_max_"))},
     "tool_preview_length": _norm_int,
 }
 

@@ -83,6 +83,7 @@ def test_override_persists_and_survives_restart(store_factory, tmp_path):
         "model": "gpt-5o",
         "provider": "openai",
         "base_url": "https://api.openai.example/v1",
+        "api_mode": "responses",
     }
 
 
@@ -144,9 +145,10 @@ def test_runner_rehydrates_override_after_restart(store_factory):
 def test_sanitize_model_override():
     assert sanitize_model_override(None) is None
     assert sanitize_model_override({}) is None
-    assert sanitize_model_override({"api_key": "sk-x", "api_mode": "chat"}) is None
+    assert sanitize_model_override({"api_key": "sk-x", "api_mode": "chat"}) == {"api_mode": "chat"}
     assert sanitize_model_override(OVERRIDE) == {
         "model": "gpt-5o",
         "provider": "openai",
         "base_url": "https://api.openai.example/v1",
+        "api_mode": "responses",
     }

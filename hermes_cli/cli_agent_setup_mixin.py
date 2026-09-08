@@ -182,13 +182,11 @@ class CLIAgentSetupMixin:
         try:
             runtime = resolve_runtime_provider(
                 requested=self.requested_provider, explicit_api_key=self._explicit_api_key,
-                explicit_base_url=self._explicit_base_url)
+                explicit_base_url=self._explicit_base_url, target_model=self.model)
         except Exception as exc:
             _primary_exc = exc
         if _primary_exc is not None:
             runtime = self._resolve_fallback_runtime(_primary_exc)
-            if runtime is not None:
-                _primary_exc = None
         if runtime is None:
             message = format_runtime_provider_error(_primary_exc) if _primary_exc else "Provider resolution failed."
             ChatConsole().print(f"[bold red]{message}[/]")
@@ -197,7 +195,8 @@ class CLIAgentSetupMixin:
         base_url = runtime.get("base_url")
         resolved_provider = runtime.get("provider", "openrouter")
         resolved_routing = (
-            resolved_provider, runtime.get("api_mode", self.api_mode), runtime.get("command"),
+            resolved_provider, (getattr(self, "_explicit_api_mode", "") if _primary_exc is None else "")
+            or runtime.get("api_mode", self.api_mode), runtime.get("command"),
             list(runtime.get("args") or []))
         # A callable api_key is a bearer-token provider (Azure Entra ID): the OpenAI SDK
         # invokes it per request, so skip string validation / placeholder substitution.
@@ -383,7 +382,7 @@ class CLIAgentSetupMixin:
                     route["model"], provider=runtime["provider"], base_url=runtime["base_url"])
             except Exception:
                 pass
-        route["request_overrides"] = overrides
+        route["request_overrides"] = {**(getattr(self, "_settings_request_overrides", None) or {}), **(overrides or {})} or None
         return route
 
     def _follow_compression_chain(self, session_meta, announce):
@@ -524,7 +523,8 @@ class CLIAgentSetupMixin:
                 ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
                 prefill_messages=self.prefill_messages or None,
                 reasoning_config=self.reasoning_config, service_tier=self.service_tier,
-                request_overrides=request_overrides, providers_allowed=self._providers_only,
+                request_overrides=request_overrides, capabilities=getattr(self, "_settings_capabilities", None),
+                providers_allowed=self._providers_only,
                 providers_ignored=self._providers_ignore, providers_order=self._providers_order,
                 provider_sort=self._provider_sort,
                 provider_require_parameters=self._provider_require_params,

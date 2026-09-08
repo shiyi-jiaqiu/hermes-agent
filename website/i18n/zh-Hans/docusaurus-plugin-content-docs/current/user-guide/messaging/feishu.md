@@ -241,6 +241,57 @@ FEISHU_ALLOW_BOTS=mentions   # 默认：none
 
 授予 `application:bot.basic_info:read` 权限范围可显示对端机器人名称；未授权时，对端机器人仍可正常路由，但显示为其 `open_id`。
 
+## 控制面板
+
+执行 `/panel`，或 `/panel model`、`/panel reasoning`、`/panel sessions`、`/panel status` 打开对应页面。按钮仅供打开面板的操作者使用，并遵守 Hermes 发送者授权与群策略。会话列表限定在当前聊天、话题与用户对应的会话范围内。
+
+面板由单个 Gateway 进程拥有。Gateway 重启后旧卡失效，需要重新执行 `/panel`；聊天记录和会话设置仍由原有会话数据库持久化。同一操作者在同一聊天/话题中打开新面板，会替代旧面板。
+
+`/quick`、`/daily`、`/deep` 和 `/mode <名称> [fast|normal]` 使用配置中的预设。Panel、Gateway 命令、CLI 与 TUI/Desktop 共享设置操作：保留原始模型别名，解析完整的模型、供应商、端点及 API 协议，再将路由、推理和服务等级一起保存，下一轮创建客户端时生效。修改前需停止正在运行的回合。会话写入失败时保持原设置；`--global` 还会写入 Profile 默认值，配置文件与会话数据库分别写入，部分成功会明确报告。
+
+```yaml
+mode_presets:
+  quick: {model: your-quick-alias, reasoning: high, fast_mode: false}
+  daily: {model: your-daily-alias, reasoning: high, fast_mode: false}
+  deep: {model: your-deep-alias, reasoning: max, fast_mode: false}
+feishu_panel:
+  hidden_providers: []
+  hidden_model_prefixes: {}
+```
+
+请先按自己的供应商定义这些模型别名。供应商可见性由当前 Profile 配置决定；相同 Profile 和配置版本的面板共享模型发现任务，各面板单独计算当前选项。
+
+旧版配置可执行 `python -m scripts.migrate_feishu_settings --config ~/.hermes/config.yaml` 预览，再加 `--apply` 写入。迁移会在没有 `quick` 时将 `mode_presets.fast` 重命名为 `quick`，并把旧的隐藏规则转入 YAML。已有隐藏列表保持不变，写入前生成备份，可重复执行。
+
+## 编码进度卡片
+
+飞书可以把工具执行过程显示为一张持续更新的交互式卡片，包括经过脱敏与长度限制的终端命令、按工具调用 ID 对应的完成状态、耗时/退出码，以及有长度限制的文件 Diff。卡片采用飞书 Card JSON 2.0，每个工具对应一个独立的原生 Markdown 组件：Terminal 命令使用 `bash` 代码块、文件改动使用 `diff` 代码块，搜索/读取参数以带标签的字段逐行展示，不再用分号拼成一行。代码块样式、复制按钮及客户端支持的语法高亮均由飞书原生提供，不需要 HTML 或第三方渲染器。此功能默认关闭，可按下列方式启用：
+
+```yaml
+# ~/.hermes/config.yaml
+display:
+  tool_progress_command: true
+  interim_assistant_messages: true
+  show_commentary: true
+  platforms:
+    feishu:
+      tool_progress: all
+      tool_preview_length: 1000
+      tool_progress_grouping: accumulate
+      tool_progress_style: card       # text | card
+      tool_edit_display: diff         # off | summary | diff
+      tool_diff_visibility: private   # private | all
+      tool_diff_max_files: 6
+      tool_diff_max_lines: 80
+      tool_diff_max_chars: 6000
+      tool_progress_max_items: 4
+      tool_progress_card_max_chars: 7200
+```
+
+`patch` 直接复用工具返回的 unified diff；对于本地 `write_file`，Hermes 会在写入前保存快照，并在工具完成后生成 Diff。Diff 在离开 Gateway 前会强制进行密钥脱敏和长度限制。推荐保持 `tool_diff_visibility: private`：私聊显示受限源码 Diff，群聊只显示文件名及增删行数摘要。
+
+编码进度卡片只属于展示层，不会改变工具结果、会话历史、提示词或提示词缓存。卡片发送或更新失败时停止本轮进度展示，工具执行与最终回答继续正常进行。工具之间的空隙仍显示执行中，只有明确的回合结束信号才进入完成、失败或中断状态。展示状态仅保留活跃调用、有限条近期记录和累计计数。这类卡片没有按钮，因此除普通消息发送权限外，不需要新增应用权限或事件订阅。
+
 ## 交互式卡片操作
 
 当用户点击机器人发送的交互式卡片上的按钮或与其交互时，适配器将这些操作路由为合成的 `/card` 命令事件：
