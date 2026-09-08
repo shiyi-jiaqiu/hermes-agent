@@ -8,7 +8,6 @@ Hermes controls are executed through the gateway control service.
 from .actions import PanelAction, PanelActionError, parse_panel_action
 from .controller import FeishuPanelController, PanelCallbackResult
 from .state import PanelState
-from .store import PanelStateStore
 
 __all__ = [
     "FeishuPanelController",
@@ -16,6 +15,5 @@ __all__ = [
     "PanelActionError",
     "PanelCallbackResult",
     "PanelState",
-    "PanelStateStore",
     "parse_panel_action",
 ]

@@ -26,6 +26,13 @@ def _make_event(text="/reasoning", platform=Platform.TELEGRAM, user_id="12345", 
     return MessageEvent(text=text, source=source)
 
 
+@pytest.fixture(autouse=True)
+def runtime_credentials(monkeypatch):
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **kwargs: {
+        "model": kwargs.get("target_model") or "gpt-5.4", "provider": kwargs.get("requested") or "openai-codex",
+        "api_key": "test-key", "base_url": "https://chatgpt.com/backend-api/codex", "api_mode": "codex_responses"})
+
+
 def _make_runner():
     """Create a bare GatewayRunner without calling __init__."""
     runner = object.__new__(gateway_run.GatewayRunner)
@@ -42,6 +49,8 @@ def _make_runner():
     runner.hooks.emit = AsyncMock()
     runner.hooks.loaded_hooks = []
     runner._session_db = None
+    runner.session_store = types.SimpleNamespace(get_runtime_settings=lambda key: None,
+                                                get_model_override=lambda key: None)
     runner._get_or_create_gateway_honcho = lambda session_key: (None, None)
     return runner
 
@@ -107,6 +116,15 @@ class TestReasoningCommand:
         monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
 
         runner = _make_runner()
+        from gateway.config import GatewayConfig
+        from gateway.session import SessionStore
+        from hermes_state import SessionDB
+        runner.session_store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+        db = SessionDB(db_path=tmp_path / "state.db")
+        runner.session_store._db_pinned = db
+        runner.config = GatewayConfig()
+        runner._normalize_source_for_session_key = lambda source: source
+        runner._resolve_profile_home_for_source = lambda source: hermes_home
         event = _make_event(f"/reasoning {effort}")
         session_key = runner._session_key_for_source(event.source)
 
@@ -149,7 +167,6 @@ class TestReasoningCommand:
 
         monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
         monkeypatch.setattr(gateway_run, "_env_path", hermes_home / ".env")
-        monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
         monkeypatch.setattr(
             gateway_run,
             "_resolve_runtime_agent_kwargs",

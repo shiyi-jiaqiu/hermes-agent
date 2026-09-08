@@ -49,7 +49,7 @@ class PanelAction:
 
 def parse_panel_action(raw_value: Any) -> PanelAction:
     """Parse only references/indices; never accept commands or trusted values."""
-    value = normalize_mapping(raw_value)
+    value = raw_value
     if not isinstance(value, dict) or value.get("panel_action") not in {True, 1, "1"}:
         raise PanelActionError("not a panel action")
     try:

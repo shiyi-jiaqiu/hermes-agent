@@ -1,131 +1,72 @@
+"""Exercise the real RPC, session DB and next-turn publication contract."""
+from contextlib import contextmanager
 from types import SimpleNamespace
-
+from unittest.mock import Mock
+import threading
 import pytest
-
 from tui_gateway import server
+from hermes_state import SessionDB
+from hermes_cli.model_switch import ModelSwitchResult
 
 
 @pytest.fixture
-def mode_rpc(monkeypatch):
+def mode_rpc(monkeypatch, tmp_path):
     sid = "mode-rpc-session"
-    agent = SimpleNamespace(
-        model="old-model",
-        provider="old-provider",
-        base_url="",
-        api_mode="codex_responses",
-        reasoning_config={"enabled": True, "effort": "low"},
-        service_tier="priority",
-        request_overrides={"service_tier": "priority"},
-    )
-    session = {
-        "session_key": sid,
-        "running": False,
-        "agent": agent,
-        "model_override": {"model": "old-model", "provider": "old-provider"},
-        "create_reasoning_override": {"enabled": True, "effort": "low"},
-        "create_service_tier_override": "priority",
-        "slash_worker": None,
-    }
-    server._sessions[sid] = session
-
-    config = {
-        "mode_presets": {
-            "fast": {"model": "flash-cpa", "reasoning": "high", "fast_mode": False}
-        },
-        "model_aliases": {
-            "flash-cpa": {"model": "target-model", "provider": "target-provider"}
-        },
-    }
-    monkeypatch.setattr(server, "_load_cfg", lambda: config)
-    monkeypatch.setattr(server, "_resolve_model", lambda: "old-model")
+    agent = SimpleNamespace(model="old", provider="old-provider", base_url="", api_mode="chat_completions",
+                            reasoning_config={"enabled": True, "effort": "low"}, service_tier=None,
+                            release_clients=Mock())
+    ready = threading.Event()
+    ready.set()
+    session = dict(session_key=sid, running=False, agent=agent, agent_ready=ready,
+                   history_lock=threading.Lock(), create_reasoning_override=agent.reasoning_config,
+                   create_service_tier_override="", slash_worker=None)
+    cfg = {"mode_presets": {"quick": {"model": "endpoint-alias", "reasoning": "high"}}}
+    db = SessionDB(db_path=tmp_path / "state.db")
+    @contextmanager
+    def database(session):
+        yield db
+    monkeypatch.setitem(server._sessions, sid, session)
+    monkeypatch.setattr(server, "_session_db", database)
+    monkeypatch.setattr(server, "_load_cfg", lambda: cfg)
     monkeypatch.setattr(server, "_load_service_tier", lambda: None)
-    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda _session: None)
-    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
-    monkeypatch.setattr(server, "_session_info", lambda *args, **kwargs: {})
-    monkeypatch.setattr(server, "_restart_slash_worker", lambda *args, **kwargs: None)
-
-    def config_set(rid, params):
-        key = params["key"]
-        if key == "model":
-            session["model_override"] = {
-                "model": "target-model",
-                "provider": "target-provider",
-            }
-            agent.model = "target-model"
-            agent.provider = "target-provider"
-        elif key == "reasoning":
-            session["create_reasoning_override"] = {
-                "enabled": True,
-                "effort": "high",
-            }
-            agent.reasoning_config = session["create_reasoning_override"]
-        elif key == "fast":
-            session["create_service_tier_override"] = ""
-            agent.service_tier = None
-            agent.request_overrides = {}
-        return {"jsonrpc": "2.0", "id": rid, "result": {"key": key, "value": params["value"]}}
-
-    monkeypatch.setitem(server._methods, "config.set", config_set)
-    try:
-        yield sid, session, agent, config
-    finally:
-        server._sessions.pop(sid, None)
+    monkeypatch.setattr(server, "_emit", Mock())
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **kwargs: ModelSwitchResult(
+        True, "target", "custom:cpa", api_key="secret", base_url="https://cpa.test/v1", api_mode="codex_responses"))
+    yield sid, session, agent, db
+    db.close()
 
 
 @pytest.mark.parametrize("command", ["/quick", "/mode quick"])
-def test_mode_apply_routes_quick_to_panel_preset(mode_rpc, command):
-    sid, session, agent, _config = mode_rpc
+def test_mode_rpc_persists_route_and_defers_client_construction(mode_rpc, command):
+    sid, session, agent, db = mode_rpc
+    response = server._methods["mode.apply"]("r", {"session_id": sid, "command": command})
+    result = response["result"]
+    assert result["applied"]
+    assert result["actual"] == db.get_runtime_settings(sid)
+    assert session["model_override"]["api_mode"] == "codex_responses"
+    assert session["model_override"]["base_url"] == "https://cpa.test/v1"
+    assert session["agent"] is None and session["lazy"]
+    assert not session["agent_ready"].is_set()
+    agent.release_clients.assert_called_once()
+    resumed = server._stored_session_runtime_overrides(db.get_session(sid))
+    assert resumed["model_override"]["api_mode"] == "codex_responses"
+    assert resumed["reasoning_config_override"]["effort"] == "high"
 
-    response = server._methods["mode.apply"](
-        "r1", {"session_id": sid, "command": command}
-    )
 
-    assert response["result"]["mode"] == "quick"
-    assert "Mode `quick` applied" in response["result"]["output"]
-    assert session["model_override"] == {
-        "model": "target-model",
-        "provider": "target-provider",
-    }
-    assert agent.reasoning_config["effort"] == "high"
-    assert agent.service_tier is None
+def test_busy_rpc_never_changes_runtime_or_database(mode_rpc):
+    sid, session, agent, db = mode_rpc
+    session["running"] = True
+    response = server._methods["mode.apply"]("r", {"session_id": sid, "command": "/quick"})
+    assert not response["result"]["applied"]
+    assert session["agent"] is agent and db.get_session(sid) is None
+    agent.release_clients.assert_not_called()
 
 
-def test_mode_apply_restores_state_after_verification_failure(mode_rpc, monkeypatch):
-    sid, session, agent, _config = mode_rpc
-    original_override = dict(session["model_override"])
-    original_reasoning = dict(session["create_reasoning_override"])
-    original_tier = session["create_service_tier_override"]
-
-    def wrong_model_set(rid, params):
-        key = params["key"]
-        if key == "model":
-            session["model_override"] = {
-                "model": "wrong-model",
-                "provider": "wrong-provider",
-            }
-            agent.model = "wrong-model"
-            agent.provider = "wrong-provider"
-        elif key == "reasoning":
-            session["create_reasoning_override"] = {"enabled": True, "effort": "high"}
-            agent.reasoning_config = session["create_reasoning_override"]
-        elif key == "fast":
-            session["create_service_tier_override"] = ""
-            agent.service_tier = None
-        return {"jsonrpc": "2.0", "id": rid, "result": {"key": key}}
-
-    monkeypatch.setitem(server._methods, "config.set", wrong_model_set)
-
-    response = server._methods["mode.apply"](
-        "r2", {"session_id": sid, "command": "/quick"}
-    )
-
-    output = response["result"]["output"]
-    assert "verification failed" in output
-    assert "previous settings restored" in output
-    assert session["model_override"] == original_override
-    assert session["create_reasoning_override"] == original_reasoning
-    assert session["create_service_tier_override"] == original_tier
-    assert agent.model == "old-model"
-    assert agent.provider == "old-provider"
-    assert agent.reasoning_config == original_reasoning
-    assert agent.service_tier == "priority"
+def test_live_tuning_slash_uses_current_session_route(mode_rpc):
+    sid, session, agent, db = mode_rpc
+    text = server._live_slash_command_output(sid, session, "reasoning", "high")
+    assert "high" in text
+    actual = db.get_runtime_settings(sid)
+    assert actual["model"] == "old" and actual["provider"] == "old-provider"
+    assert actual["reasoning"] == "high"
+    assert session["agent"] is None

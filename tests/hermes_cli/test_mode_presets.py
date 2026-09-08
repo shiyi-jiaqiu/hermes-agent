@@ -1,42 +1,26 @@
+"""The old name is migrated once on disk; runtime resolution preserves aliases."""
+import pytest
+
 from hermes_cli.mode_presets import available_mode_names, resolve_mode_preset
+from hermes_cli.runtime_settings import mode_request
+from scripts.migrate_feishu_settings import migrate
 
 
-def test_quick_resolves_to_the_panel_quick_preset_when_stored_as_fast():
-    config = {
-        "mode_presets": {
-            "fast": {"model": "flash-cpa", "reasoning": "high", "fast_mode": False},
-            "daily": {"model": "luna", "reasoning": "max", "fast_mode": False},
-        },
-        "model_aliases": {
-            "flash-cpa": {
-                "model": "gemini-3.8-flash-high",
-                "provider": "cpa-gemini",
-            }
-        },
-    }
-
-    preset = resolve_mode_preset(config, "quick")
-
-    assert preset is not None
-    assert preset.requested_name == "quick"
-    assert preset.config_name == "fast"
-    assert preset.model_target == "flash-cpa"
-    assert preset.expected_model == "gemini-3.8-flash-high"
-    assert preset.expected_provider == "cpa-gemini"
-    assert preset.expected_reasoning == "high"
-    assert available_mode_names(config) == ["quick", "fast", "daily"]
+def test_migration_is_idempotent_and_preserves_user_choices():
+    config = {"mode_presets": {"fast": {"model": "flash-cpa", "reasoning": "high"}},
+              "feishu_panel": {"hidden_providers": ["mine"]}, "unrelated": {"keep": True}}
+    migrated, changes = migrate(config)
+    assert changes and "fast" in config["mode_presets"]  # input untouched
+    assert available_mode_names(migrated) == ["quick"]
+    assert migrated["feishu_panel"]["hidden_providers"] == ["mine"]
+    assert migrated["unrelated"] == {"keep": True}
+    assert migrate(migrated) == (migrated, [])
+    preset = resolve_mode_preset(migrated, "quick")
+    assert preset.model_target == "flash-cpa" and preset.reasoning == "high"
+    assert mode_request(migrated, "quick").model_target == "flash-cpa"
 
 
-def test_explicit_quick_preset_takes_precedence_over_legacy_fast():
-    config = {
-        "mode_presets": {
-            "fast": {"model": "old", "reasoning": "low"},
-            "quick": {"model": "new", "reasoning": "medium"},
-        }
-    }
-
-    preset = resolve_mode_preset(config, "quick")
-
-    assert preset is not None
-    assert preset.config_name == "quick"
-    assert preset.expected_model == "new"
+@pytest.mark.parametrize("modifier", ["typo", "true", "low"])
+def test_unknown_modifier_is_rejected_instead_of_silently_disabling_fast(modifier):
+    with pytest.raises(ValueError, match="Usage"):
+        mode_request({"mode_presets": {"quick": {"model": "alias", "reasoning": "high"}}}, "quick", modifier)

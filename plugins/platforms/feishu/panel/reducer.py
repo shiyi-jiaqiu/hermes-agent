@@ -45,7 +45,6 @@ def reduce_panel_state(state: PanelState, action: PanelAction) -> PanelState:
         new_state.active = False
         new_state.lifecycle = "closed"
         new_state.busy_action_id = ""
-        new_state.busy_started_at = 0.0
         new_state.view = "home"
         new_state.view_stack.clear()
     elif action.op not in {"refresh", "select"}:

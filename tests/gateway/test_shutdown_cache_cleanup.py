@@ -28,6 +28,7 @@ class _FakeGateway:
     """Minimal stand-in with just enough state for ``stop()`` to run."""
 
     def __init__(self):
+        self._sessions = {}
         self._running = True
         self._draining = False
         self._restart_requested = False
@@ -50,6 +51,9 @@ class _FakeGateway:
         self._pending_messages = {}
         self._pending_approvals = {}
         self._busy_ack_ts = {}
+
+    def _sessions_map(self):
+        return self._sessions
 
     def _running_agent_count(self):
         return len(self._running_agents)

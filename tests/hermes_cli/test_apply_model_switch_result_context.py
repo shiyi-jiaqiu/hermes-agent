@@ -31,6 +31,15 @@ class _FakeModelInfo:
 
 class _StubCLI:
     """Minimum attrs ``_apply_model_switch_result`` reads on ``self``."""
+    def __init__(self):
+        from cli import HermesCLI
+        HermesCLI._init_prompt_and_reasoning(self, None)
+
+    def _stage_and_swap_model(self, result, old_model):
+        # Staging + in-place swap lives in a helper; run the real one on this stub.
+        import cli as _cli_mod
+        return _cli_mod.HermesCLI._stage_and_swap_model(self, result, old_model)
+
     agent = None
     model = ""
     provider = ""
@@ -41,6 +50,20 @@ class _StubCLI:
     _explicit_base_url = ""
     api_mode = ""
     _pending_model_switch_note = ""
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def session_database(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=tmp_path / "state.db")
+    for key, value in {"session_id": "settings", "_session_db": db,
+                       "reasoning_config": None, "service_tier": None}.items():
+        monkeypatch.setattr(_StubCLI, key, value, raising=False)
+    yield db
+    db.close()
 
 
 def _run_display(monkeypatch, result):
@@ -128,7 +151,7 @@ def test_global_switch_clears_context_pin_owned_by_previous_route(monkeypatch):
     monkeypatch.setattr(
         cli_mod,
         "save_config_value",
-        lambda key, value: writes.append((key, value)),
+        lambda key, value: (writes.append((key, value)) or True),
     )
     cli = _StubCLI()
     cli.model = "shared-model"

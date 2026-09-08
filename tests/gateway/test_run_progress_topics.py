@@ -284,6 +284,10 @@ class FailingNativeTaskCardAdapter(NativeTaskCardAdapter):
 
 
 class NativeFeishuProgressAdapter(ProgressCaptureAdapter):
+    def create_tool_progress(self, source, config):
+        from plugins.platforms.feishu.progress.sender import FeishuProgress
+        return FeishuProgress(self, source, config)
+
     def __init__(self, platform=Platform.FEISHU):
         super().__init__(platform=platform)
         self.progress_cards = []

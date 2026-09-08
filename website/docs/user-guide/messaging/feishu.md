@@ -275,10 +275,58 @@ Peer bots do not need to be added to `FEISHU_ALLOWED_USERS` — that allowlist a
 
 Grant the `application:bot.basic_info:read` scope to display peer bot names; without it, peer bots still route correctly but appear as their `open_id`.
 
+## Control Panel
+
+Run `/panel` (or `/panel model`, `/panel reasoning`, `/panel sessions`, `/panel status`)
+to open a private-to-the-operator set of controls in the current chat. Buttons obey
+Hermes sender authorization and the chat's group policy. Session listings are scoped
+to the current chat/thread/user lane; they do not expose other conversations.
+
+A panel is owned by one Gateway process. Restarting the Gateway expires old cards;
+run `/panel` again. Chat history and session settings remain in the normal session
+database. Opening another panel replaces the previous panel for that operator and
+chat/thread only.
+
+`/quick`, `/daily`, `/deep`, and `/mode <name> [fast|normal]` use configured presets.
+The Panel, Gateway commands, CLI, and TUI/Desktop share the same settings operation:
+the original model alias resolves its complete model/provider/endpoint/API route,
+then route, reasoning and service tier are saved together for the next turn. Stop a
+running turn before changing these settings. A failed session write leaves its
+previous settings in place. `--global` additionally writes the profile default;
+configuration and session writes are separate and any partial outcome is reported.
+The panel displays the effective session or channel route and the Feishu-specific
+reasoning display setting. Selecting unchanged settings keeps the current agent;
+refreshed credentials or capabilities still take effect. While a save is in progress,
+new turns ask you to retry shortly, and new/resume operations wait for that save.
+Closing the panel does not cancel a save that has already started.
+
+```yaml
+mode_presets:
+  quick: {model: your-quick-alias, reasoning: high, fast_mode: false}
+  daily: {model: your-daily-alias, reasoning: high, fast_mode: false}
+  deep: {model: your-deep-alias, reasoning: max, fast_mode: false}
+feishu_panel:
+  hidden_providers: []
+  hidden_model_prefixes: {}
+```
+
+Define the model aliases for your providers first. Provider visibility is controlled
+by this profile's configuration. Model discovery is shared across panels for the
+same profile and relevant provider/auth configuration; each panel derives its own
+current selection. Inventory results expire after five minutes. Refresh fetches
+provider inventories again, including their underlying model caches. New/resume
+invalidates session and status queries that started before the change.
+
+For configurations from the old Panel implementation, run
+`python -m scripts.migrate_feishu_settings --config ~/.hermes/config.yaml` to preview
+the changed keys, then add `--apply`. The migration renames `mode_presets.fast` to
+`quick` when `quick` is absent and moves the old visibility policy into YAML. It
+preserves existing visibility lists, creates a backup, and is safe to repeat.
+
 ## Coding Progress Cards
 
-Feishu can present tool execution as one editable interactive card with full
-(redacted) terminal commands, ID-correlated completion state, duration/exit
+Feishu can present tool execution as one editable interactive card with bounded,
+redacted terminal commands, ID-correlated completion state, duration/exit
 code, and bounded file-edit diffs. Cards use Feishu Card JSON 2.0 with one
 native Markdown component per tool: terminal commands render as `bash` code
 blocks, file changes as `diff` blocks, and search/read arguments as labeled
@@ -314,9 +362,14 @@ the gateway. With `tool_diff_visibility: private` (the recommended default),
 group chats show file/addition/deletion summaries but not source lines.
 
 The card transport is presentation-only: it does not alter tool results,
-conversation history, prompts, or prompt caching. A permanent card transport
-failure falls back to the existing editable Feishu post progress. These cards
-have no buttons, so they require no app permission or event subscription beyond
+conversation history, prompts, or prompt caching. A card send/update failure stops
+progress display for that turn; tool execution and the final answer continue.
+Each card operation has a five-second total budget, including authentication,
+thread lookup and retries. The turn waits at most five seconds for its final
+progress update, then stops publishing card state and releases the session. The
+card stays Working between tools until the turn explicitly finishes; interrupted
+and failed turns have distinct terminal states. Only active calls, a bounded recent
+history, and cumulative counters are kept for display. These cards have no buttons, so they require no app permission or event subscription beyond
 normal message sending.
 
 ## Interactive Card Actions

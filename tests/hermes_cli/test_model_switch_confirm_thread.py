@@ -33,6 +33,15 @@ class _FakeAgent:
 
 
 class _StubCLI:
+    def _stage_and_swap_model(self, result, old_model):
+        # Staging + in-place swap lives in a helper; run the real one on this stub.
+        import cli as _cli_mod
+        return _cli_mod.HermesCLI._stage_and_swap_model(self, result, old_model)
+
+    def __init__(self):
+        from cli import HermesCLI
+        HermesCLI._init_prompt_and_reasoning(self, None)
+
     model = "old/model"
     provider = "openrouter"
     requested_provider = "openrouter"
@@ -58,6 +67,20 @@ class _StubCLI:
         return cli_mod.HermesCLI._confirm_and_apply_cli_model_switch(
             self, result, persist_global, one_turn, custom_provs
         )
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def session_database(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=tmp_path / "state.db")
+    for key, value in {"session_id": "settings", "_session_db": db,
+                       "reasoning_config": None, "service_tier": None}.items():
+        monkeypatch.setattr(_StubCLI, key, value, raising=False)
+    yield db
+    db.close()
 
 
 def _make_result():
@@ -107,6 +130,12 @@ def test_confirm_runs_off_main_thread_when_tui_present(monkeypatch):
     printed = []
     cli_mod = _patch_deps(monkeypatch, printed)
 
+    finished = threading.Event()
+    def printed_result(text, *args, **kwargs):
+        printed.append(str(text))
+        if str(text).startswith("Settings saved"):
+            finished.set()
+    monkeypatch.setattr(cli_mod, "_cprint", printed_result)
     called_on = {}
     ready = threading.Event()
 
@@ -128,10 +157,12 @@ def test_confirm_runs_off_main_thread_when_tui_present(monkeypatch):
     assert ready.wait(timeout=10)
     assert called_on["is_main"] is False
 
-    # Apply still lands on CLI + agent state.
+    assert finished.wait(timeout=10)
+    # The saved route is published; the next turn creates its client.
     assert stub.model == "claude-sonnet-4.6"
     assert stub.provider == "anthropic"
-    assert stub.agent.calls[-1]["new_model"] == "claude-sonnet-4.6"
+    assert stub.agent is None
+    assert stub._session_db.get_runtime_settings("settings")["api_mode"] == "anthropic_messages"
 
 
 def test_confirm_stays_synchronous_without_app(monkeypatch):

@@ -1749,3 +1749,4 @@ Hermes 使用两种不同的上下文范围：
 MESSAGING_CWD=/home/myuser/projects    # Gateway 会话
 TERMINAL_CWD=/workspace                # 所有终端会话
 ```
+  model_threshold_tokens: {}                       # 模型子串 → 绝对 token 上限；最长匹配优先

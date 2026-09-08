@@ -1,419 +1,425 @@
-"""Synchronous callback router and asynchronous control executor."""
-
+"""Loop-owned Panel state, tasks and one ordered sender per card."""
 from __future__ import annotations
 
 import asyncio
-import copy
+import concurrent.futures
 import logging
 import math
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Optional
-
-from gateway.control import HermesPanelControlService
+from typing import Any
 
 from .actions import PanelAction, PanelActionError, parse_panel_action
 from .reducer import reduce_panel_state
 from .renderer import MODEL_PAGE_SIZE, PROVIDER_PAGE_SIZE, SESSION_PAGE_SIZE, render_panel
 from .state import PanelState
-from .store import PanelStateStore
 
 logger = logging.getLogger(__name__)
-
-# A control task is process-local. If its persisted lease survives this long,
-# the task either died with a gateway reload or failed before clearing state.
-_BUSY_LEASE_SECONDS = 120.0
-
-# Feishu requires delayed-card updates to run after the callback response has
-# been delivered. The SDK callback has no response-sent hook, so keep a small
-# lower bound before using the callback token.
-_CALLBACK_SETTLE_SECONDS = 0.20
-
-# Slow data is loaded only when its page is opened. A bounded timeout keeps the
-# callback lane responsive even when provider discovery or a local endpoint is
-# offline. Model catalogs are profile-scoped and reused briefly across panels.
-_VIEW_LOAD_TIMEOUT_SECONDS = 6.0
-_MODEL_CATALOG_CACHE_TTL_SECONDS = 300.0
-_VIEW_ALIASES = {
-    "model": "model",
-    "model_provider": "model",
-    "sessions": "sessions",
-    "status": "status",
-    "home": "home",
-}
-
-# These operations contain no view-relative index and can be safely applied to
-# the latest state. This is concurrency handling, not a legacy-card fallback.
+_VIEW_ALIASES = {"model": "model", "model_provider": "model", "sessions": "sessions",
+                 "status": "status", "home": "home"}
 _REBASABLE_STALE_OPS = frozenset({"nav", "home", "close", "refresh"})
 
 
 @dataclass(frozen=True)
 class PanelCallbackResult:
-    card: Optional[dict[str, Any]] = None
     toast: str = ""
     toast_type: str = "info"
 
 
 class FeishuPanelController:
-    """Own one state machine per user/chat/thread panel scope."""
-
-    def __init__(self, adapter: Any, store: PanelStateStore):
+    def __init__(self, adapter: Any, service: Any):
         self.adapter = adapter
-        self.store = store
-        self._view_tasks: set[asyncio.Task[Any]] = set()
-        self._model_inventory_cache: dict[
-            str, tuple[float, list[dict[str, Any]]]
-        ] = {}
+        self.service = service
+        self._states: dict[str, PanelState] = {}
+        self._active: dict[str, str] = {}
+        self._messages: dict[str, str] = {}
+        self._sources: dict[str, Any] = {}
+        self._tasks: set[asyncio.Task] = set()
+        self._senders: dict[str, asyncio.Task] = {}
+        self._pending_cards: dict[str, PanelState] = {}
+        self._loads: dict[tuple[str, str], asyncio.Task] = {}
+        self._view_generations: dict[tuple[str, str], int] = {}
+        self._controls: dict[str, asyncio.Task] = {}
+        self._executing: dict[str, int] = {}
+        self._open_locks: dict[tuple, asyncio.Lock] = {}
+        self._opening: dict[tuple, int] = {}
         self._closed = False
-        # Expired rows otherwise accumulate forever because PanelStateStore is
-        # process-long-lived. Startup is a cheap, deterministic cleanup point.
-        self.store.prune()
+        self._loop = asyncio.get_running_loop()
 
-    def _service(self) -> HermesPanelControlService:
-        runner = getattr(self.adapter, "gateway_runner", None)
-        if runner is None:
-            raise RuntimeError("Feishu panel is not attached to a gateway runner")
-        return HermesPanelControlService(runner)
+    def _spawn(self, coro) -> asyncio.Task | None:
+        if self._closed:
+            coro.close()
+            return None
+        task = self._loop.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._completed)
+        return task
 
-    def _profile_for_source(self, source: Any) -> str:
-        profile = str(getattr(source, "profile", "") or "").strip()
-        runner = getattr(self.adapter, "gateway_runner", None)
-        if not profile and runner is not None:
-            try:
-                profile = str(runner._profile_name_for_source(source) or "").strip()
-            except Exception:
-                profile = ""
-        return profile or "default"
+    def _completed(self, task: asyncio.Task) -> None:
+        self._tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("Panel task failed", exc_info=task.exception())
+
+    async def close(self) -> None:
+        self._closed = True
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await self.service.close()
+        self._states.clear()
+        self._active.clear()
+        self._messages.clear()
+        self._sources.clear()
+        self._pending_cards.clear()
+        self._loads.clear()
+        self._view_generations.clear()
+        self._controls.clear()
+        self._executing.clear()
+        self._senders.clear()
 
     @staticmethod
     def _load_view_name(view: str) -> str:
-        return _VIEW_ALIASES.get(str(view or ""), "")
+        return _VIEW_ALIASES.get(view, "")
+
+    def _is_active(self, state: PanelState) -> bool:
+        return state.active and self._active.get(state.scope_key) == state.panel_id
+
+    async def open(self, **kwargs):
+        from gateway.platforms.base import SendResult
+        task = self._spawn(self._open_panel(**kwargs))
+        if task is None:
+            return SendResult(success=False, error="Panel is closed")
+        return await task
+
+    async def _open_panel(self, *, source, session_key, owner_open_id, status_text, metadata, initial_view):
+        key = (source.chat_id, source.thread_id, owner_open_id)
+        lock = self._open_locks.setdefault(key, asyncio.Lock())
+        self._opening[key] = self._opening.get(key, 0) + 1
+        state = None
+        attached = False
+        try:
+            async with lock:
+                self._prune()
+                state = await self.create_panel_state(source=source, session_key=session_key,
+                    owner_open_id=owner_open_id, status_text=status_text, initial_view=initial_view)
+                result = await self.adapter.send_coding_progress_card(source.chat_id, render_panel(state),
+                                                                       metadata=metadata)
+                if not result.success:
+                    return result
+                attached = self.attach_message_id(state, result.message_id)
+                if not attached:
+                    from gateway.platforms.base import SendResult
+                    return SendResult(success=False, error="Card sent without a usable message ID")
+                view = self._load_view_name(initial_view)
+                if view and view != "home":
+                    self.schedule_view_load(state.panel_id, view)
+                return result
+        finally:
+            if state is not None and not attached:
+                self.discard(state)
+            self._opening[key] -= 1
+            if not self._opening[key]:
+                del self._opening[key]
+                del self._open_locks[key]
+
+    def _prune(self):
+        """Retain active cards plus a small retired tail; never remove an owned task's state."""
+        now = time.time()
+        retired = []
+        for state in self._states.values():
+            if state.panel_id not in self._messages:
+                continue  # a first send is still in progress
+            if state.expires_at <= now:
+                state.active = False
+            if not state.active:
+                retired.append(state)
+        excess = max(0, len(retired) - 64)
+        for state in retired:
+            panel_id = state.panel_id
+            if panel_id in self._senders or any(key[0] == panel_id for key in self._loads):
+                continue
+            if state.scope_key in self._controls or state.busy_action_id or state.panel_id in self._executing:
+                continue
+            if state.expires_at <= now or excess > 0:
+                self.discard(state)
+                excess -= 1
+
+    async def create_panel_state(self, *, source, session_key: str, status_text: str = "",
+                                 owner_open_id: str, initial_view: str = "home") -> PanelState:
+        if self._closed:
+            raise RuntimeError("Panel is closed")
+        if not owner_open_id:
+            raise ValueError("Panel owner open_id is required")
+        data = await self.service.snapshot(source=source, session_key=session_key,
+                                          status_text=status_text, include_catalog=False,
+                                          include_sessions=False, include_status=False)
+        if self._closed:
+            raise RuntimeError("Panel is closed")
+        data.update(loaded_views=["home"], loading_views=[], load_errors={})
+        state = PanelState(panel_id=f"p_{uuid.uuid4().hex}", app_id=self.adapter._app_id,
+                           owner_open_id=owner_open_id, chat_id=source.chat_id,
+                           thread_id=source.thread_id or "", session_key=session_key,
+                           profile=source.profile or "default", chat_type=source.chat_type, data=data)
+        if initial_view in {"model", "reasoning", "sessions", "status"}:
+            state.view, state.view_stack = initial_view, ["home"]
+            if self._load_view_name(initial_view):
+                self._mark_view_loading(state, initial_view)
+        self._states[state.panel_id] = state
+        self._sources[state.panel_id] = source
+        return state
+
+    def attach_message_id(self, state: PanelState, message_id: str) -> bool:
+        """Publish only a successfully sent card; binding never changes its UI revision."""
+        if self._closed or state.panel_id not in self._states or not message_id:
+            return False
+        self._messages[state.panel_id] = message_id
+        previous_id = self._active.get(state.scope_key)
+        self._active[state.scope_key] = state.panel_id
+        if previous_id and previous_id != state.panel_id:
+            previous = self._states[previous_id]
+            previous.active, previous.lifecycle = False, "replaced"
+            previous.revision += 1
+            self._queue_card(previous)
+        return True
+
+    def discard(self, state: PanelState) -> None:
+        self._states.pop(state.panel_id, None)
+        self._sources.pop(state.panel_id, None)
+        self._messages.pop(state.panel_id, None)
+        self._pending_cards.pop(state.panel_id, None)
+        for key in list(self._view_generations):
+            if key[0] == state.panel_id:
+                del self._view_generations[key]
+        if self._active.get(state.scope_key) == state.panel_id:
+            del self._active[state.scope_key]
+
+    def _queue_card(self, state: PanelState) -> None:
+        if self._closed or state.panel_id not in self._messages:
+            return
+        self._pending_cards[state.panel_id] = state
+        if state.panel_id not in self._senders:
+            self._senders[state.panel_id] = self._spawn(self._send_cards(state.panel_id))
+
+    async def _send_cards(self, panel_id: str) -> None:
+        try:
+            while panel_id in self._pending_cards:
+                card = render_panel(self._pending_cards.pop(panel_id))
+                result = await self.adapter.patch_interactive_message(
+                    message_id=self._messages[panel_id], card=card)
+                if not result.success:
+                    logger.warning("Panel card update failed: %s", result.error)
+        finally:
+            self._senders.pop(panel_id, None)
+            self._prune()
 
     @staticmethod
     def _mark_view_loading(state: PanelState, view: str) -> None:
-        name = FeishuPanelController._load_view_name(view)
-        if not name:
-            return
-        loaded = set(state.data.get("loaded_views") or [])
-        loading = set(state.data.get("loading_views") or [])
-        loaded.discard(name)
-        loading.add(name)
-        state.data["loaded_views"] = sorted(loaded)
-        state.data["loading_views"] = sorted(loading)
-        errors = dict(state.data.get("load_errors") or {})
-        errors.pop(name, None)
-        state.data["load_errors"] = errors
-
-    async def create_panel_state(
-        self,
-        *,
-        source: Any,
-        session_key: str,
-        status_text: str,
-        owner_open_id: str = "",
-        initial_view: str = "home",
-    ) -> tuple[PanelState, Optional[PanelState]]:
-        owner = str(
-            owner_open_id
-            or getattr(source, "user_id", "")
-            or getattr(source, "user_id_alt", "")
-            or ""
-        ).strip()
-        if not owner:
-            raise ValueError("Panel owner identity is required")
-        data = await self._service().snapshot(
-            source=source,
-            session_key=session_key,
-            status_text=status_text,
-            # Opening a panel must not wait for provider discovery, session
-            # enumeration, or status formatting. Those are hydrated after the
-            # initial card has been acknowledged by Feishu.
-            include_catalog=False,
-            include_sessions=False,
-            include_status=False,
-        )
-        data["loaded_views"] = ["home"]
-        data["loading_views"] = []
-        data["load_errors"] = {}
-        state = PanelState(
-            panel_id=f"p_{uuid.uuid4().hex}",
-            message_id="",
-            app_id=str(getattr(self.adapter, "_app_id", "") or "feishu"),
-            owner_open_id=owner,
-            chat_id=str(getattr(source, "chat_id", "") or ""),
-            thread_id=str(getattr(source, "thread_id", "") or ""),
-            session_key=str(session_key or ""),
-            profile=self._profile_for_source(source),
-            chat_type=str(getattr(source, "chat_type", "") or "group"),
-            user_id=str(getattr(source, "user_id", "") or ""),
-            user_id_alt=str(getattr(source, "user_id_alt", "") or ""),
-            user_name=str(getattr(source, "user_name", "") or ""),
-            data=data,
-        )
-        if initial_view in {"model", "reasoning", "sessions", "status"}:
-            state.view = initial_view
-            state.view_stack = ["home"]
-            if self._load_view_name(initial_view):
-                self._mark_view_loading(state, initial_view)
-        replaced = self.store.create_active(state)
-        return state, replaced
+        view = _VIEW_ALIASES.get(view, view)
+        state.data["loaded_views"] = [v for v in state.data["loaded_views"] if v != view]
+        state.data["loading_views"] = [*state.data["loading_views"], view]
+        state.data["load_errors"] = {k: v for k, v in state.data["load_errors"].items() if k != view}
 
     def schedule_view_load(self, panel_id: str, view: str) -> bool:
-        """Load one page after its initial card has been sent."""
-        if self._closed:
+        view = self._load_view_name(view)
+        if self._closed or not view:
             return False
-        try:
-            task = asyncio.create_task(self._load_view(panel_id=panel_id, view=view))
-        except RuntimeError:
-            return False
-        self._view_tasks.add(task)
-
-        def _complete(done: asyncio.Task[Any]) -> None:
-            self._view_tasks.discard(done)
-            if done.cancelled():
-                return
-            try:
-                done.result()
-            except Exception:
-                logger.warning("[Feishu Panel] view load failed", exc_info=True)
-
-        task.add_done_callback(_complete)
+        key = panel_id, view
+        if key not in self._loads:
+            generation = self._view_generations.get(key, 0)
+            self._loads[key] = self._spawn(self._load_view(panel_id, view, generation))
         return True
 
-    async def close(self) -> None:
-        """Cancel owned loaders and close the process-lifetime state store."""
-        if self._closed:
-            return
-        self._closed = True
-        tasks = list(self._view_tasks)
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._view_tasks.clear()
-        self.store.prune()
-        self.store.close()
+    def _invalidate_views(self, state, views):
+        for view in views:
+            key = state.panel_id, view
+            self._view_generations[key] = self._view_generations.get(key, 0) + 1
+            self._loads.pop(key, None)  # old tasks remain owned; their results cannot publish
+        state.data["loaded_views"] = [v for v in state.data["loaded_views"] if v not in views]
+        state.data["loading_views"] = [v for v in state.data["loading_views"] if v not in views]
 
-    @staticmethod
-    def _view_snapshot_flags(view: str) -> tuple[bool, bool, bool]:
-        return view == "model", view == "sessions", view == "status"
-
-    @staticmethod
-    def _view_payload(view: str, snapshot: dict[str, Any]) -> dict[str, Any]:
-        keys: tuple[str, ...]
-        if view == "model":
-            keys = ("model_providers", "model_options")
-        elif view == "sessions":
-            keys = ("sessions",)
-        elif view == "status":
-            keys = ("status_text", "running")
-        else:
-            # Home refreshes only cheap local/session state. Optional catalogs
-            # are absent because all include flags are false.
-            return dict(snapshot)
-        return {key: snapshot[key] for key in keys if key in snapshot}
-
-    async def _update_loaded_card(
-        self,
-        state: PanelState,
-        *,
-        callback_token: str = "",
-        callback_started_at: float = 0.0,
-    ) -> None:
-        if not state.message_id:
-            return
-        card = render_panel(state)
-        if callback_token:
-            elapsed = time.monotonic() - callback_started_at
-            if elapsed < _CALLBACK_SETTLE_SECONDS:
-                await asyncio.sleep(_CALLBACK_SETTLE_SECONDS - elapsed)
-            update = await self.adapter.update_interactive_card_after_callback(
-                callback_token=callback_token,
-                card=card,
-            )
-            if not update.success:
-                logger.warning(
-                    "[Feishu Panel] callback-token update failed panel=%s; "
-                    "falling back to message update: %s",
-                    state.panel_id,
-                    update.error,
-                )
-                update = await self.adapter.update_interactive_message(
-                    message_id=state.message_id,
-                    card=card,
-                )
-        else:
-            # This path is only used for an initial /panel <view> card, before
-            # any interaction callback exists.
-            update = await self.adapter.update_interactive_message(
-                message_id=state.message_id,
-                card=card,
-            )
-        if not update.success:
-            logger.warning(
-                "[Feishu Panel] failed to update loaded view panel=%s view=%s: %s",
-                state.panel_id,
-                state.view,
-                update.error,
-            )
-
-    async def _load_view(
-        self,
-        *,
-        panel_id: str,
-        view: str,
-        callback_token: str = "",
-        callback_started_at: float = 0.0,
-        force_reload: bool = False,
-    ) -> None:
-        """Load only the data required by one view, under a hard deadline."""
-        view = self._load_view_name(view)
-        if not view:
-            return
-        state = self.store.get(panel_id)
-        if state is None or not self.store.is_active(state):
-            return
-        include_catalog, include_sessions, include_status = self._view_snapshot_flags(view)
-        error = ""
-        payload: dict[str, Any] | None = None
-        cache_key = state.profile or "default"
-        cached_inventory: list[dict[str, Any]] | None = None
-        if view == "model" and not force_reload:
-            cached = self._model_inventory_cache.get(cache_key)
-            if cached and time.monotonic() - cached[0] < _MODEL_CATALOG_CACHE_TTL_SECONDS:
-                cached_inventory = copy.deepcopy(cached[1])
+    async def _load_view(self, panel_id: str, view: str, generation: int) -> None:
         try:
-            source = self._source(state)
-            if payload is None:
-                snapshot = await asyncio.wait_for(
-                    self._service().snapshot(
-                        source=source,
-                        session_key=state.session_key,
-                        status_text="",
-                        include_catalog=include_catalog,
-                        include_sessions=include_sessions,
-                        include_status=include_status,
-                        catalog_provider_rows=cached_inventory,
-                    ),
-                    timeout=_VIEW_LOAD_TIMEOUT_SECONDS,
-                )
-                if view == "model":
-                    inventory = snapshot.get("_model_provider_inventory")
-                    if cached_inventory is None and isinstance(inventory, list):
-                        self._model_inventory_cache[cache_key] = (
-                            time.monotonic(),
-                            copy.deepcopy(inventory),
-                        )
-                payload = self._view_payload(view, snapshot)
-        except asyncio.TimeoutError:
-            payload = {}
-            error = f"加载超时（>{_VIEW_LOAD_TIMEOUT_SECONDS:g}s），请重试"
+            state = self._states[panel_id]
+            snapshot = await self.service.snapshot(
+                source=self._sources[panel_id], session_key=state.session_key, status_text="",
+                include_catalog=view == "model", include_sessions=view == "sessions",
+                include_status=view == "status")
+            payload_keys = {"model": ("model_providers", "model_options"),
+                            "sessions": ("sessions",), "status": ("status_text", "running")}
+            payload = ({key: snapshot[key] for key in payload_keys[view]} if view in payload_keys else snapshot)
+            error = ""
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            logger.warning(
-                "[Feishu Panel] view load failed panel=%s view=%s: %s",
-                panel_id,
-                view,
-                exc,
-                exc_info=True,
-            )
-            payload = {}
-            error = f"加载失败：{str(exc)[:120]}"
+            logger.warning("Panel view failed: %s", exc)
+            payload, error = {}, "加载失败，请刷新重试"
+        finally:
+            if self._loads.get((panel_id, view)) is asyncio.current_task():
+                self._loads.pop((panel_id, view), None)
+        latest = self._states.get(panel_id)
+        if (self._closed or latest is None or not self._is_active(latest)
+                or generation != self._view_generations.get((panel_id, view), 0)):
+            return
+        latest.data.update(payload)
+        latest.data["loading_views"] = [v for v in latest.data["loading_views"] if v != view]
+        if error:
+            latest.data["load_errors"][view] = error
+        else:
+            latest.data["loaded_views"] = [*latest.data["loaded_views"], view]
+            latest.data["load_errors"].pop(view, None)
+        latest.revision += 1
+        self._queue_card(latest)
 
-        updated: PanelState | None = None
-        for _attempt in range(3):
-            latest = self.store.get(panel_id)
-            if latest is None or not self.store.is_active(latest):
+    def handle_sync(self, raw_value: dict, *, open_id: str, chat_id: str, loop) -> PanelCallbackResult:
+        """The SDK thread only posts work; all state access runs on the owning loop."""
+        try:
+            action = parse_panel_action(raw_value)
+        except PanelActionError:
+            return PanelCallbackResult("无效的面板操作", "error")
+        if loop is not self._loop or self._closed:
+            return PanelCallbackResult("面板已失效，请重新打开 /panel", "warning")
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is self._loop:
+            return self._handle(action, open_id, chat_id)
+        result = concurrent.futures.Future()
+        def dispatch():
+            if not result.set_running_or_notify_cancel():
                 return
-            expected = latest.revision
-            latest.data.update(payload)
-            loaded = set(latest.data.get("loaded_views") or [])
-            loading = set(latest.data.get("loading_views") or [])
-            errors = dict(latest.data.get("load_errors") or {})
-            loading.discard(view)
-            if error:
-                loaded.discard(view)
-                errors[view] = error
+            try:
+                result.set_result(self._handle(action, open_id, chat_id))
+            except Exception as exc:
+                result.set_exception(exc)
+        try:
+            self._loop.call_soon_threadsafe(dispatch)
+        except RuntimeError:
+            return PanelCallbackResult("面板已失效，请重新打开 /panel", "warning")
+        try:
+            return result.result(timeout=2)
+        except concurrent.futures.TimeoutError:
+            result.cancel()
+            return PanelCallbackResult("面板繁忙，请重试", "warning")
+
+    def _handle(self, action: PanelAction, open_id: str, chat_id: str) -> PanelCallbackResult:
+        state = self._states.get(action.panel_id)
+        if self._closed or state is None or state.expires_at <= time.time():
+            return PanelCallbackResult("面板已失效，请重新打开 /panel", "warning")
+        if open_id != state.owner_open_id or chat_id != state.chat_id:
+            return PanelCallbackResult("无权操作此面板", "error")
+        if not self.adapter.is_control_panel_operator_authorized(self._sources[state.panel_id], open_id):
+            return PanelCallbackResult("无权操作此面板", "error")
+        if not self._is_active(state):
+            return PanelCallbackResult("此面板已关闭或被替代，请使用最新 /panel", "warning")
+        if action.nonce in state.handled_nonces:
+            return PanelCallbackResult("该操作已经处理", "warning")
+        if action.revision != state.revision and not (
+            action.revision < state.revision and action.op in _REBASABLE_STALE_OPS):
+            self._queue_card(state)
+            return PanelCallbackResult("页面已更新，请重试", "warning")
+        if action.op == "exec":
+            if state.scope_key in self._controls and action.target != "stop":
+                return PanelCallbackResult("已有控制操作正在处理", "warning")
+            self._executing[state.panel_id] = self._executing.get(state.panel_id, 0) + 1
+            if action.target == "stop":
+                self._spawn(self._execute_control(state.panel_id, action, stop=True))
             else:
-                loaded.add(view)
-                errors.pop(view, None)
-            latest.data["loaded_views"] = sorted(loaded)
-            latest.data["loading_views"] = sorted(loading)
-            latest.data["load_errors"] = errors
-            latest.revision += 1
-            if self.store.compare_and_set(expected, latest):
-                updated = latest
-                break
-        if updated is not None:
-            await self._update_loaded_card(
-                updated,
-                callback_token=callback_token,
-                callback_started_at=callback_started_at,
-            )
+                state.busy_action_id = action.nonce
+                self._controls[state.scope_key] = self._spawn(self._execute_control(state.panel_id, action))
+            state.remember_nonce(action.nonce)
+            state.revision += 1
+            self._queue_card(state)
+            return PanelCallbackResult("正在处理…")
+        try:
+            updated = self._navigate(state, action)
+        except PanelActionError as exc:
+            return PanelCallbackResult(str(exc), "error")
+        updated.remember_nonce(action.nonce)
+        updated.revision += 1
+        self._states[state.panel_id] = updated
+        self._clamp_page(updated)
+        view = self._load_view_name(updated.view)
+        if updated.active and view and view not in updated.data["loaded_views"]:
+            if (state.panel_id, view) not in self._loads:
+                self._mark_view_loading(updated, view)
+                self.schedule_view_load(updated.panel_id, view)
+        self._queue_card(updated)
+        return PanelCallbackResult("面板已关闭" if action.op == "close" else "")
 
-    def _fail_view_load_schedule(
-        self,
-        panel_id: str,
-        view: str,
-        message: str,
-    ) -> PanelState | None:
-        """Turn an unscheduled loading state into a retryable error state."""
-        for _attempt in range(3):
-            latest = self.store.get(panel_id)
-            if latest is None or not self.store.is_active(latest):
-                return latest
-            expected = latest.revision
-            loading = set(latest.data.get("loading_views") or [])
-            loaded = set(latest.data.get("loaded_views") or [])
-            errors = dict(latest.data.get("load_errors") or {})
-            loading.discard(view)
-            loaded.discard(view)
-            errors[view] = message
-            latest.data["loading_views"] = sorted(loading)
-            latest.data["loaded_views"] = sorted(loaded)
-            latest.data["load_errors"] = errors
-            latest.revision += 1
-            if self.store.compare_and_set(expected, latest):
-                return latest
-        return self.store.get(panel_id)
+    def _navigate(self, state: PanelState, action: PanelAction) -> PanelState:
+        if action.op == "refresh":
+            updated = state.clone()
+            view = self._load_view_name(updated.view) or "home"
+            self._invalidate_views(updated, {view})
+            if view == "model":
+                self.service.invalidate_catalog(self._sources[state.panel_id])
+            return updated
+        if action.op != "select":
+            return reduce_panel_state(state, action)
+        if action.index is None:
+            raise PanelActionError("无效的选择")
+        updated = state.clone()
+        if action.target == "model_provider":
+            providers = state.data.get("model_providers", [])
+            if action.index >= len(providers):
+                raise PanelActionError("供应商选择已失效")
+            provider = providers[action.index]
+            if not provider["model_indices"]:
+                raise PanelActionError("该供应商没有可用模型")
+            updated.filters["model_provider"] = provider["slug"]
+            updated.view_stack.append(state.view)
+            updated.view = "model_provider"
+        elif action.target == "global_reasoning":
+            if action.index >= len(state.data["reasoning_options"]):
+                raise PanelActionError("选择已失效")
+            updated.data["pending_global_reasoning_index"] = action.index
+            updated.view_stack.append(state.view)
+            updated.view = "confirm_global_reasoning"
+        else:
+            raise PanelActionError("无效的选择")
+        updated.page = 0
+        return updated
 
-    def attach_message_id(self, state: PanelState, message_id: str) -> bool:
-        current = self.store.get(state.panel_id)
-        if current is None:
-            return False
-        expected = current.revision
-        current.message_id = str(message_id or "")
-        return self.store.compare_and_set(expected, current)
-
-    def discard(self, state: PanelState) -> None:
-        self.store.delete(state.panel_id)
-
-    def _source(self, state: PanelState) -> Any:
-        source = self.adapter.build_source(
-            chat_id=state.chat_id,
-            chat_name=state.chat_id or "Feishu Chat",
-            chat_type=state.chat_type,
-            user_id=state.user_id or state.owner_open_id,
-            user_name=state.user_name or state.owner_open_id,
-            thread_id=state.thread_id or None,
-            user_id_alt=state.user_id_alt or None,
-        )
-        source.profile = state.profile or "default"
-        return source
-
-    @staticmethod
-    def _event_identity(data: Any) -> tuple[str, str]:
-        event = getattr(data, "event", None)
-        operator = getattr(event, "operator", None)
-        operator_id = getattr(operator, "operator_id", None)
-        open_id = str(
-            getattr(operator, "open_id", "")
-            or getattr(operator_id, "open_id", "")
-            or ""
-        )
-        context = getattr(event, "context", None)
-        chat_id = str(getattr(context, "open_chat_id", "") or "")
-        return open_id, chat_id
+    async def _execute_control(self, panel_id: str, action: PanelAction, *, stop=False) -> None:
+        state = self._states[panel_id]
+        try:
+            result = await self.service.execute(source=self._sources[panel_id],
+                session_key=state.session_key, target=action.target, index=action.index,
+                state_data=state.data)
+            flash = f"{'✅' if result.success else '❌'} {result.text}"[:300]
+            snapshot = await self.service.snapshot(source=self._sources[panel_id],
+                session_key=state.session_key, status_text="", include_catalog=False,
+                include_sessions=False, include_status=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Panel control failed")
+            snapshot, flash = {}, "❌ 操作失败，请刷新查看实际设置"
+        finally:
+            self._executing[panel_id] -= 1
+            if not self._executing[panel_id]:
+                del self._executing[panel_id]
+            if not stop:
+                self._controls.pop(state.scope_key, None)
+                self._states[panel_id].busy_action_id = ""
+        active_id = self._active.get(state.scope_key)
+        latest = self._states.get(active_id)
+        if latest is None or not self._is_active(latest):
+            return
+        latest.data.update(snapshot)
+        latest.data["flash"] = flash
+        latest.data.pop("pending_global_reasoning_index", None)
+        invalidated = {"status", "sessions"} if action.target in {"new", "resume"} else {"status"}
+        self._invalidate_views(latest, invalidated)
+        if action.target in {"new", "resume", "preset"}:
+            latest.view, latest.view_stack, latest.page = "home", [], 0
+        elif action.target == "global_reasoning":
+            latest.view, latest.view_stack, latest.page = "reasoning", ["home"], 0
+        latest.revision += 1
+        self._queue_card(latest)
 
     @staticmethod
     def _clamp_page(state: PanelState) -> None:
@@ -442,316 +448,3 @@ class FeishuPanelController:
             state.page = min(max(0, state.page), pages - 1)
         else:
             state.page = 0
-
-    def handle_sync(self, data: Any, raw_value: Any, loop: Any) -> PanelCallbackResult:
-        """Validate, CAS and render before Feishu's three-second deadline."""
-        callback_started_at = time.monotonic()
-        callback_token = str(
-            getattr(getattr(data, "event", None), "token", "") or ""
-        )
-        try:
-            action = parse_panel_action(raw_value)
-        except PanelActionError:
-            return PanelCallbackResult(toast="无效的面板操作", toast_type="error")
-        state = self.store.get(action.panel_id)
-        if state is None or state.expires_at <= time.time():
-            return PanelCallbackResult(toast="此面板已过期，请重新打开 /panel", toast_type="warning")
-        open_id, chat_id = self._event_identity(data)
-        if open_id != state.owner_open_id or (chat_id and chat_id != state.chat_id):
-            logger.warning(
-                "[Feishu Panel] rejected owner/chat mismatch panel=%s operator=%s chat=%s",
-                state.panel_id,
-                open_id or "<unknown>",
-                chat_id or "<unknown>",
-            )
-            return PanelCallbackResult(toast="你无权操作此用户的面板", toast_type="error")
-        if not self.adapter._is_interactive_operator_authorized(open_id):
-            return PanelCallbackResult(toast="未授权的面板操作", toast_type="error")
-        if not self.store.is_active(state):
-            state.active = False
-            state.lifecycle = "replaced" if state.lifecycle == "replaced" else state.lifecycle
-            return PanelCallbackResult(card=render_panel(state), toast="此面板已被替代，请使用最新面板", toast_type="warning")
-
-        # Recover an orphaned process-local task lease. This is deliberately
-        # checked before revision/nonce validation so a card left busy by a
-        # crash or reload can heal on the first callback instead of remaining
-        # permanently disabled.
-        if state.busy_action_id and (
-            not state.busy_started_at
-            or time.time() - state.busy_started_at >= _BUSY_LEASE_SECONDS
-        ):
-            recovered = state.clone()
-            recovered.busy_action_id = ""
-            recovered.busy_started_at = 0.0
-            recovered.data["flash"] = "⚠️ 上一次控制任务已中断，面板已自动恢复"
-            recovered.revision += 1
-            if self.store.compare_and_set(state.revision, recovered):
-                return PanelCallbackResult(
-                    card=render_panel(recovered),
-                    toast="已恢复中断的控制任务，请重试刚才的操作",
-                    toast_type="warning",
-                )
-            state = self.store.get(state.panel_id) or state
-        if action.nonce in state.handled_nonces:
-            return PanelCallbackResult(card=render_panel(state), toast="该操作已经处理", toast_type="warning")
-        if action.revision != state.revision and not (
-            action.revision < state.revision
-            and (
-                action.op in _REBASABLE_STALE_OPS
-                or (action.op == "exec" and action.target == "stop")
-            )
-        ):
-            return PanelCallbackResult(card=render_panel(state), toast="页面已更新，已恢复到最新状态", toast_type="warning")
-
-        if action.op in {"nav", "back", "home", "page", "close"}:
-            try:
-                new_state = reduce_panel_state(state, action)
-            except PanelActionError:
-                return PanelCallbackResult(card=render_panel(state), toast="当前页面不支持该操作", toast_type="error")
-            self._clamp_page(new_state)
-            load_view = self._load_view_name(new_state.view)
-            loaded_views = set(new_state.data.get("loaded_views") or [])
-            loading_views = set(new_state.data.get("loading_views") or [])
-            needs_load = bool(
-                load_view
-                and load_view not in loaded_views
-                and load_view not in loading_views
-            )
-            if needs_load:
-                if not callback_token.startswith("c-"):
-                    return PanelCallbackResult(
-                        card=render_panel(state),
-                        toast="飞书回调凭证无效，请重新打开面板",
-                        toast_type="error",
-                    )
-                self._mark_view_loading(new_state, load_view)
-            new_state.remember_nonce(action.nonce)
-            new_state.revision += 1
-            if not self.store.compare_and_set(state.revision, new_state):
-                latest = self.store.get(state.panel_id) or state
-                return PanelCallbackResult(card=render_panel(latest), toast="页面已被其他操作更新", toast_type="warning")
-            if needs_load:
-                scheduled = self.adapter._submit_on_loop(
-                    loop,
-                    self._load_view(
-                        panel_id=state.panel_id,
-                        view=load_view,
-                        callback_token=callback_token,
-                        callback_started_at=callback_started_at,
-                    ),
-                )
-                if not scheduled:
-                    failed = self._fail_view_load_schedule(
-                        state.panel_id,
-                        load_view,
-                        "页面加载任务无法调度，请重试",
-                    ) or new_state
-                    return PanelCallbackResult(
-                        card=render_panel(failed),
-                        toast="页面加载任务无法调度，请重试",
-                        toast_type="error",
-                    )
-            return PanelCallbackResult(
-                card=render_panel(new_state),
-                toast="面板已关闭" if action.op == "close" else "",
-            )
-
-        if action.op == "select":
-            if action.index is None:
-                return PanelCallbackResult(card=render_panel(state), toast="无效的选择", toast_type="error")
-            new_state = state.clone()
-            if action.target == "model_provider":
-                providers = list(state.data.get("model_providers") or [])
-                if action.index >= len(providers):
-                    return PanelCallbackResult(card=render_panel(state), toast="供应商选择已失效", toast_type="error")
-                provider = providers[action.index]
-                slug = str(provider.get("slug") or "") if isinstance(provider, dict) else ""
-                if not slug or not list(provider.get("model_indices") or []):
-                    return PanelCallbackResult(card=render_panel(state), toast="该供应商没有可用模型", toast_type="warning")
-                new_state.filters["model_provider"] = slug
-                if new_state.view != "model_provider":
-                    new_state.view_stack.append(new_state.view)
-                new_state.view = "model_provider"
-            elif action.target == "global_reasoning":
-                options = list(state.data.get("reasoning_options") or [])
-                if action.index >= len(options):
-                    return PanelCallbackResult(card=render_panel(state), toast="选择已失效", toast_type="error")
-                new_state.data["pending_global_reasoning_index"] = action.index
-                new_state.view_stack.append(new_state.view)
-                new_state.view = "confirm_global_reasoning"
-            else:
-                return PanelCallbackResult(card=render_panel(state), toast="无效的选择", toast_type="error")
-            new_state.page = 0
-            new_state.remember_nonce(action.nonce)
-            new_state.revision += 1
-            if not self.store.compare_and_set(state.revision, new_state):
-                latest = self.store.get(state.panel_id) or state
-                return PanelCallbackResult(card=render_panel(latest), toast="页面已被其他操作更新", toast_type="warning")
-            return PanelCallbackResult(card=render_panel(new_state))
-
-        if action.op == "refresh":
-            if not callback_token.startswith("c-"):
-                return PanelCallbackResult(
-                    card=render_panel(state),
-                    toast="飞书回调凭证无效，请重新打开面板",
-                    toast_type="error",
-                )
-            refresh_view = self._load_view_name(state.view) or "home"
-            if refresh_view in set(state.data.get("loading_views") or []):
-                return PanelCallbackResult(
-                    card=render_panel(state),
-                    toast="当前页面正在刷新",
-                    toast_type="warning",
-                )
-            refreshing = state.clone()
-            self._mark_view_loading(refreshing, refresh_view)
-            refreshing.data.pop("flash", None)
-            refreshing.remember_nonce(action.nonce)
-            refreshing.revision += 1
-            if not self.store.compare_and_set(state.revision, refreshing):
-                latest = self.store.get(state.panel_id) or state
-                return PanelCallbackResult(card=render_panel(latest), toast="刷新发生冲突，请重试", toast_type="warning")
-            scheduled = self.adapter._submit_on_loop(
-                loop,
-                self._load_view(
-                    panel_id=state.panel_id,
-                    view=refresh_view,
-                    callback_token=callback_token,
-                    callback_started_at=callback_started_at,
-                    force_reload=True,
-                ),
-            )
-            if not scheduled:
-                failed = self._fail_view_load_schedule(
-                    state.panel_id,
-                    refresh_view,
-                    "刷新任务无法调度，请重试",
-                ) or refreshing
-                return PanelCallbackResult(
-                    card=render_panel(failed),
-                    toast="刷新任务无法调度",
-                    toast_type="error",
-                )
-            return PanelCallbackResult(card=render_panel(refreshing), toast="正在刷新…")
-
-        if action.op != "exec":
-            return PanelCallbackResult(card=render_panel(state), toast="不支持的面板操作", toast_type="error")
-        target = action.target
-        if not callback_token.startswith("c-"):
-            return PanelCallbackResult(
-                card=render_panel(state),
-                toast="飞书回调凭证无效，请重新打开面板",
-                toast_type="error",
-            )
-        if state.busy_action_id and target != "stop":
-            return PanelCallbackResult(card=render_panel(state), toast="已有控制操作正在处理", toast_type="warning")
-
-        busy = state.clone()
-        busy.busy_action_id = action.nonce
-        busy.busy_started_at = time.time()
-        busy.data.pop("flash", None)
-        busy.remember_nonce(action.nonce)
-        busy.revision += 1
-        if not self.store.compare_and_set(state.revision, busy):
-            latest = self.store.get(state.panel_id) or state
-            return PanelCallbackResult(card=render_panel(latest), toast="操作发生冲突，请重试", toast_type="warning")
-        scheduled = self.adapter._submit_on_loop(
-            loop,
-            self._execute_control(
-                panel_id=state.panel_id,
-                action_id=action.nonce,
-                target=target,
-                index=action.index,
-                state_data=state.data,
-                callback_token=callback_token,
-                callback_started_at=callback_started_at,
-            ),
-        )
-        if not scheduled:
-            failed = self.store.get(state.panel_id) or busy
-            expected = failed.revision
-            failed.busy_action_id = ""
-            failed.busy_started_at = 0.0
-            failed.data["flash"] = "❌ 控制任务无法调度，请重试"
-            failed.revision += 1
-            self.store.compare_and_set(expected, failed)
-            return PanelCallbackResult(card=render_panel(failed), toast="控制任务无法调度", toast_type="error")
-        return PanelCallbackResult(card=render_panel(busy), toast="正在处理…")
-
-    async def _execute_control(
-        self,
-        *,
-        panel_id: str,
-        action_id: str,
-        target: str,
-        index: int | None,
-        state_data: dict[str, Any],
-        callback_token: str = "",
-        callback_started_at: float = 0.0,
-    ) -> None:
-        state = self.store.get(panel_id)
-        if state is None or state.busy_action_id != action_id or not self.store.is_active(state):
-            return
-        source = self._source(state)
-        try:
-            result = await self._service().execute(
-                source=source,
-                session_key=state.session_key,
-                target=target,
-                index=index,
-                state_data=state_data,
-            )
-            snapshot = await self._service().snapshot(
-                source=source,
-                session_key=state.session_key,
-                status_text="",
-                include_catalog=False,
-                include_sessions=False,
-                include_status=False,
-            )
-        except Exception as exc:
-            logger.error("[Feishu Panel] control execution failed: %s", exc, exc_info=True)
-            result = None
-            snapshot = dict(state.data)
-            snapshot["flash"] = f"❌ 操作失败：{str(exc)[:180]}"
-
-        latest = self.store.get(panel_id)
-        if latest is None or latest.busy_action_id != action_id or not self.store.is_active(latest):
-            return
-        expected = latest.revision
-        latest.data.update(snapshot)
-        if result is not None:
-            prefix = "✅" if result.success else "❌"
-            text = str(result.text or "").strip()
-            # Slash-command handlers often include their own status glyph.
-            # Do not produce the screenshot-visible "✅ ✅ ..." duplication.
-            latest.data["flash"] = (
-                text
-                if text.startswith(("✅", "❌"))
-                else f"{prefix} {text}"
-            )[:300]
-        latest.busy_action_id = ""
-        latest.busy_started_at = 0.0
-        latest.data.pop("pending_global_reasoning_index", None)
-        loaded_views = set(latest.data.get("loaded_views") or [])
-        loaded_views.discard("status")
-        if target in {"new", "resume"}:
-            loaded_views.discard("sessions")
-        latest.data["loaded_views"] = sorted(loaded_views)
-        if target in {"new", "resume", "preset"}:
-            latest.view = "home"
-            latest.view_stack.clear()
-            latest.page = 0
-        elif target == "global_reasoning":
-            latest.view = "reasoning"
-            latest.view_stack = [view for view in latest.view_stack if view not in {"reasoning_global", "confirm_global_reasoning"}]
-            latest.page = 0
-        latest.revision += 1
-        if not self.store.compare_and_set(expected, latest):
-            return
-        if latest.message_id:
-            await self._update_loaded_card(
-                latest,
-                callback_token=callback_token,
-                callback_started_at=callback_started_at,
-            )

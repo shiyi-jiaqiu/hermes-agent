@@ -96,6 +96,21 @@ class TestHandleReasoningCommand(unittest.TestCase):
         from hermes_cli.cli_commands_mixin import CLICommandsMixin
 
         stub = self._make_cli(reasoning_config={"enabled": True, "effort": "medium"})
+        from hermes_state import SessionDB
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        db = SessionDB(db_path=Path(directory.name) / "state.db")
+        self.addCleanup(db.close)
+        stub.session_id, stub._session_db = "settings", db
+        stub._pending_one_turn_model_restore = None
+        stub._settings_reasoning_inherited = False
+        stub._settings_request_overrides = stub._settings_capabilities = None
+        stub.model, stub.provider = "gpt-5.4", "openai-codex"
+        stub.base_url, stub.api_mode, stub.api_key = "", "codex_responses", ""
+        stub.service_tier = getattr(stub, "service_tier", None)
+        stub.reasoning_config = getattr(stub, "reasoning_config", None)
         with patch("cli.save_config_value") as save_config, patch("cli._cprint"):
             CLICommandsMixin._handle_reasoning_command(stub, "/reasoning high")
 

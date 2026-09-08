@@ -17,6 +17,7 @@ from gateway.tool_progress_diff import EditDiffSummary
 
 _STATUS = {
     "running": ("blue", "Running", "→"),
+    "interrupted": ("orange", "Interrupted", "■"),
     "success": ("green", "Success", "✓"),
     "error": ("red", "Error", "✗"),
 }
@@ -60,6 +61,12 @@ _CODE_TOOLS = {
 }
 
 
+# Only values consumed by the native card belong in its presentation queue.
+TOOL_ARGUMENT_KEYS = {name: tuple(key for key, _label in fields) for name, fields in _DETAIL_FIELDS.items()}
+TOOL_ARGUMENT_KEYS.update({name: (key,) for name, (key, _language) in _CODE_TOOLS.items()})
+TOOL_ARGUMENT_KEYS["terminal"] = ("command", "workdir")
+
+
 def _safe_inline(value: Any, limit: int = 1000) -> str:
     """Return compact text safe inside a Markdown inline-code span."""
     text = " ".join(str(value or "").replace("`", "ˋ").split())
@@ -91,28 +98,6 @@ def _display_value(value: Any) -> str:
         except (TypeError, ValueError):
             pass
     return str(value or "")
-
-
-def _redact_display_value(value: Any) -> Any:
-    """Apply the mandatory egress redactor recursively to card arguments."""
-    if isinstance(value, dict):
-        return {str(key): _redact_display_value(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_redact_display_value(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_redact_display_value(item) for item in value)
-    if not isinstance(value, str):
-        return value
-    from agent.redact import redact_sensitive_text
-
-    return redact_sensitive_text(value, force=True, redact_url_credentials=True)
-
-
-def _display_args(item: dict[str, Any]) -> dict[str, Any]:
-    raw_args = item.get("args")
-    if not isinstance(raw_args, dict):
-        return {}
-    return _redact_display_value(raw_args)
 
 
 def _duration(item: dict[str, Any]) -> str:
@@ -158,13 +143,13 @@ def _inline_or_block(label: str, value: Any, *, language: str = "text") -> list[
 
 def _tool_detail_lines(item: dict[str, Any]) -> list[str]:
     name = str(item.get("tool_name") or "")
-    args = _display_args(item)
+    args = item.get("args") or {}
     code_spec = _CODE_TOOLS.get(name)
     if code_spec:
         key, language = code_spec
         value = args.get(key)
         if value in (None, ""):
-            value = _redact_display_value(item.get("preview") or "")
+            value = (item.get("preview") or "")
         code = _safe_code(value)
         lines = [f"```{language}", code, "```"] if code else []
         if name == "terminal" and args.get("workdir"):
@@ -183,7 +168,7 @@ def _tool_detail_lines(item: dict[str, Any]) -> list[str]:
         if lines:
             return lines
 
-    preview = _redact_display_value(item.get("preview") or "")
+    preview = (item.get("preview") or "")
     if preview:
         lines.extend(_inline_or_block("Details", preview))
     return lines
@@ -228,7 +213,7 @@ def _render_tool_markdown(
     if isinstance(diff, EditDiffSummary) and edit_display in {"summary", "diff"}:
         lines.extend(("", *_diff_summary_lines(diff, include_body=edit_display == "diff")))
     if item.get("status") == "error" and item.get("error"):
-        error = _safe_inline(_redact_display_value(item["error"]), 300)
+        error = _safe_inline(item["error"], 300)
         lines.extend(("", f"**Error**", f"> {error}"))
     return "\n".join(lines).strip()
 
@@ -273,44 +258,29 @@ def _render_blocks(
     return blocks, omitted
 
 
-def _render_markdown(
-    items: list[dict[str, Any]],
-    *,
-    edit_display: str,
-    max_items: int,
-    max_chars: int,
-) -> str:
-    """Render the portable text/post fallback as one Markdown document."""
-    blocks, omitted = _render_blocks(
-        items,
-        edit_display=edit_display,
-        max_items=max_items,
-        max_chars=max_chars,
-    )
-    parts = ["\n\n---\n\n".join(blocks) or "Preparing tools…"]
-    if omitted:
-        parts.append(f"_… {omitted} earlier tool call(s) hidden_")
-    return "\n\n".join(parts)
-
-
 def render_progress_card(
     items: Iterable[dict[str, Any]],
     *,
-    finalized: bool = False,
+    turn_status: str = "working",
+    total_calls: int = 0,
+    error_count: int = 0,
     edit_display: str = "diff",
     max_items: int = 4,
     max_chars: int = 7200,
 ) -> dict[str, Any]:
     """Build a full replacement Card JSON 2.0 interactive card."""
     materialized = [dict(item) for item in items]
-    has_error = any(item.get("status") == "error" for item in materialized)
-    still_running = any(item.get("status") == "running" for item in materialized)
-    if has_error:
+    has_error = error_count > 0 or any(item.get("status") == "error" for item in materialized)
+    if turn_status != "working":
+        for item in materialized:
+            if item.get("status") == "running":
+                item["status"] = "interrupted"
+                turn_status = "interrupted"
+    states = {"working": ("blue", "Working"), "finished": ("green", "Completed"),
+              "interrupted": ("orange", "Interrupted"), "failed": ("red", "Failed")}
+    template, state = states[turn_status]
+    if turn_status == "finished" and has_error:
         template, state = "red", "Completed with errors"
-    elif finalized or (materialized and not still_running):
-        template, state = "green", "Completed"
-    else:
-        template, state = "blue", "Working"
 
     normalized_max_items = max(1, int(max_items or 1))
     normalized_max_chars = max(500, int(max_chars or 7200))
@@ -320,6 +290,7 @@ def render_progress_card(
         max_items=normalized_max_items,
         max_chars=normalized_max_chars,
     )
+    omitted += max(0, total_calls - len(materialized))
     elements: list[dict[str, Any]] = []
     if omitted:
         elements.append(
@@ -351,19 +322,3 @@ def render_progress_card(
             "elements": elements,
         },
     }
-
-
-def render_progress_fallback(
-    items: Iterable[dict[str, Any]],
-    *,
-    edit_display: str = "summary",
-    max_items: int = 4,
-    max_chars: int = 7000,
-) -> str:
-    """Text/post fallback when interactive-card transport is unavailable."""
-    return "**⚕ Hermes Coding Progress**\n\n" + _render_markdown(
-        [dict(item) for item in items],
-        edit_display=edit_display,
-        max_items=max(1, int(max_items or 1)),
-        max_chars=max(500, int(max_chars or 7000)),
-    )
