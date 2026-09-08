@@ -39,6 +39,7 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+_PROGRESS_FINALIZE_TIMEOUT = 5.0
 
 
 class GatewayTurnMixin:
@@ -3513,12 +3514,22 @@ class GatewayTurnMixin:
             outcome = turn_ctx.progress_outcome
             turn_ctx.native_progress.finish(turn_ctx.progress_queue, outcome)
             try:
-                await asyncio.wait_for(asyncio.shield(progress_task), timeout=5)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                progress_task.cancel()
-                await asyncio.gather(progress_task, return_exceptions=True)
+                done, _ = await asyncio.wait({progress_task}, timeout=_PROGRESS_FINALIZE_TIMEOUT)
+                if done:
+                    progress_task.result()
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 logger.exception("Native progress finalization failed")
+            finally:
+                turn_ctx.native_progress.stop()
+                if not progress_task.done():
+                    progress_task.cancel()
+                    # Optional presentation cannot extend the turn's deadline. Retain the
+                    # cancelled task until its transport unwinds, without awaiting it below.
+                    self._retain_background_task(progress_task)
+                    progress_task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+                    progress_task = None
         for task in (progress_task, log_task, interrupt_monitor, _notify_task):
             if task:
                 task.cancel()

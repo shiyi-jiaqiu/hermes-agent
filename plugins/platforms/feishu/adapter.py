@@ -1165,7 +1165,8 @@ def _sdk_domain(domain_name: str) -> Any:
 
 
 def _build_lark_client(app_id: str, app_secret: str, sdk_domain: Any) -> Any:
-    return lark.Client.builder().app_id(app_id).app_secret(app_secret).domain(sdk_domain).log_level(lark.LogLevel.WARNING).build()
+    return (lark.Client.builder().app_id(app_id).app_secret(app_secret).domain(sdk_domain)
+            .enable_set_token(True).timeout(30).log_level(lark.LogLevel.WARNING).build())
 
 
 def _card_button(label: str, btn_type: str, value: Dict[str, Any]) -> Dict[str, Any]:
@@ -1213,6 +1214,9 @@ class FeishuAdapter(FeishuCardsMixin, BasePlatformAdapter):
         self._settings = self._load_settings(config.extra or {})
         self._apply_settings(self._settings)
         self._client: Optional[Any] = None
+        self._card_token = ""
+        self._card_token_expires = 0.0
+        self._card_token_lock = asyncio.Lock()
         # Adapter-owned pool for blocking SDK calls, recreated on demand: a torn-down default
         # executor can no longer wedge sends with "Executor shutdown has been called".
         # See issue #10849.
@@ -1388,6 +1392,9 @@ class FeishuAdapter(FeishuCardsMixin, BasePlatformAdapter):
         """Run a blocking Feishu SDK call on the adapter-owned thread pool."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._get_sdk_executor(), func, *args)
+
+    async def _message_request(self, name, request):
+        return await self._run_blocking(getattr(self._client.im.v1.message, name), request)
 
     def _shutdown_sdk_executor(self) -> None:
         """Stop the adapter-owned SDK executor without touching the loop default."""
@@ -3601,14 +3608,14 @@ class FeishuAdapter(FeishuCardsMixin, BasePlatformAdapter):
             chat_id=chat_id, msg_type=msg_type, payload=payload, reply_to=reply_to, metadata=metadata,
         )
 
-    async def _fetch_last_message_in_thread(self, thread_id: str) -> Optional[str]:
+    async def _fetch_last_message_in_thread(self, thread_id: str, *, message_call=None) -> Optional[str]:
         """Fetch the last message_id in a thread for reply-based routing."""
         if not self._client or not thread_id:
             return None
         try:
             from lark_oapi.api.im.v1 import ListMessageRequest
             request = ListMessageRequest.builder().container_id_type("thread").container_id(thread_id).page_size(1).build()
-            response = await asyncio.to_thread(self._client.im.v1.message.list, request)
+            response = await (message_call or self._message_request)("list", request)
             if self._response_succeeded(response):
                 items = getattr(getattr(response, "data", None), "items", None)
                 if items and len(items) > 0:
@@ -3619,7 +3626,9 @@ class FeishuAdapter(FeishuCardsMixin, BasePlatformAdapter):
 
     async def _send_raw_message(
         self, *, chat_id: str, msg_type: str, payload: str, reply_to: Optional[str], metadata: Optional[Dict[str, Any]],
+        message_call=None,
     ) -> Any:
+        message_call = message_call or self._message_request
         thread_id = (metadata or {}).get("thread_id")
         effective_reply_to = reply_to or ((metadata or {}).get("reply_to_message_id") if thread_id else None)
         if effective_reply_to:
@@ -3627,7 +3636,7 @@ class FeishuAdapter(FeishuCardsMixin, BasePlatformAdapter):
                 content=payload, msg_type=msg_type, reply_in_thread=bool(thread_id), uuid_value=str(uuid.uuid4()),
             )
             request = self._build_reply_message_request(effective_reply_to, body)
-            return await self._run_blocking(self._client.im.v1.message.reply, request)
+            return await message_call("reply", request)
         if thread_id:
             # reply→create fallback inside a topic: thread_id as receive_id keeps it in the topic.
             receive_id, receive_id_type = thread_id, "thread_id"
@@ -3639,7 +3648,7 @@ class FeishuAdapter(FeishuCardsMixin, BasePlatformAdapter):
             receive_id=receive_id, msg_type=msg_type, content=payload, uuid_value=str(uuid.uuid4()),
         )
         request = self._build_create_message_request(receive_id_type, body)
-        return await self._run_blocking(self._client.im.v1.message.create, request)
+        return await message_call("create", request)
 
     @staticmethod
     def _response_succeeded(response: Any) -> bool:
@@ -3762,6 +3771,8 @@ class FeishuAdapter(FeishuCardsMixin, BasePlatformAdapter):
     def _prepare_client(self) -> Any:
         """Build the lark client + event dispatcher for this adapter's domain; returns the SDK domain."""
         domain = _sdk_domain(self._domain_name)
+        self._card_token = ""
+        self._card_token_expires = 0.0
         self._client = self._build_lark_client(domain)
         self._event_handler = self._build_event_handler()
         if self._event_handler is None:
@@ -3773,16 +3784,18 @@ class FeishuAdapter(FeishuCardsMixin, BasePlatformAdapter):
 
     async def _feishu_send_with_retry(
         self, *, chat_id: str, msg_type: str, payload: str, reply_to: Optional[str], metadata: Optional[Dict[str, Any]],
+        message_call=None,
     ) -> Any:
         last_error: Optional[Exception] = None
         active_reply_to = reply_to
         if not active_reply_to and metadata and metadata.get("thread_id"):
             active_reply_to = metadata.get("reply_to_message_id") or await self._fetch_last_message_in_thread(
-                str(metadata["thread_id"]))
+                str(metadata["thread_id"]), message_call=message_call)
 
         async def _raw(reply_target: Optional[str]) -> Any:
             return await self._send_raw_message(
                 chat_id=chat_id, msg_type=msg_type, payload=payload, reply_to=reply_target, metadata=metadata,
+                message_call=message_call,
             )
 
         for attempt in range(_FEISHU_SEND_ATTEMPTS):

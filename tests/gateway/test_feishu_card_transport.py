@@ -29,23 +29,39 @@ def adapter():
 
 
 @pytest.mark.asyncio
-async def test_native_send_and_patch_use_interactive_card_sdk_contract(adapter):
-    adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=SimpleNamespace(patch=object()))))
-    adapter._feishu_send_with_retry = AsyncMock(return_value=object())
-    adapter._run_blocking = AsyncMock(return_value=object())
-    adapter._finalize_send_result = lambda response, default_message: SendResult(True, message_id="card")
-    card = render_progress_card([], turn_status="working")
-    sent = await adapter.send_coding_progress_card("chat", card, reply_to="anchor", metadata={"thread_id": "topic"})
+async def test_native_send_and_patch_use_interactive_card_sdk_contract(adapter, monkeypatch):
+    from lark_oapi.core.http import Transport
+    from lark_oapi.core.model import RawResponse
+    adapter._client = module._build_lark_client('test-app', 'test-secret', 'https://sdk.test')
+    calls = []
+    async def exchange(config, request, option=None):
+        calls.append(request)
+        assert config.enable_set_token and config.timeout is not None
+        response = RawResponse()
+        if 'tenant_access_token' in request.uri:
+            payload = {'code': 0, 'tenant_access_token': 'test-token', 'expire': 7200}
+        else:
+            assert option.tenant_access_token == 'test-token'
+            payload = {'code': 0, 'data': {'message_id': 'card'}}
+        response.content = json.dumps(payload).encode()
+        return response
+    def no_sync(*args, **kwargs):
+        pytest.fail('Native card I/O must not use synchronous authentication or HTTP')
+    monkeypatch.setattr(Transport, 'aexecute', exchange)
+    monkeypatch.setattr(Transport, 'execute', no_sync)
+    card = render_progress_card([], turn_status='working')
+    sent = await adapter.send_coding_progress_card('chat', card, reply_to='anchor', metadata={'thread_id': 'topic'})
     assert sent.success
-    sent_args = adapter._feishu_send_with_retry.await_args.kwargs
-    assert sent_args["msg_type"] == "interactive" and sent_args["reply_to"] == "anchor"
-    assert sent_args["metadata"] == {"thread_id": "topic"}
-    assert json.loads(sent_args["payload"])["schema"] == "2.0"
-    updated = await adapter.update_coding_progress_card("card", card)
-    request = adapter._run_blocking.await_args.args[1]
+    reply = calls[-1]
+    assert reply.request_body.msg_type == 'interactive' and reply.message_id == 'anchor'
+    assert reply.request_body.reply_in_thread is True
+    assert json.loads(reply.request_body.content)['schema'] == '2.0'
+    updated = await adapter.update_coding_progress_card('card', card)
+    request = calls[-1]
     assert isinstance(request, PatchMessageRequest)
-    assert request.message_id == updated.message_id == "card"
-    assert json.loads(request.request_body.content)["config"]["update_multi"] is True
+    assert request.message_id == updated.message_id == 'card'
+    assert json.loads(request.request_body.content)['config']['update_multi'] is True
+    assert len(calls) == 3  # token + reply + patch; token reused on this adapter
 
 
 @pytest.mark.asyncio
@@ -104,20 +120,23 @@ async def test_card_fragments_dispatch_once_with_native_ack_and_noncard_delegati
 
 
 @pytest.mark.asyncio
-async def test_card_cancellation_joins_owned_io_before_returning(adapter):
-    started, release = asyncio.Event(), asyncio.Event()
+async def test_card_cancellation_stops_io_without_waiting_for_remote_release(adapter):
+    started, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
     async def request():
         started.set()
-        await release.wait()
-        return "delivered"
+        try:
+            await release.wait()
+        finally:
+            cancelled.set()
     task = asyncio.create_task(adapter._card_io(request()))
     await started.wait()
     task.cancel()
-    await asyncio.sleep(0)
-    assert not task.done()
-    release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    try:
+        done, _ = await asyncio.wait({task}, timeout=2)
+        assert done and cancelled.is_set()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -132,8 +151,54 @@ async def test_profile_namespaced_plugin_uses_current_sdk_without_canonical_modu
     adapter = loaded.FeishuAdapter(PlatformConfig())
     response = adapter._build_panel_callback_response(PanelCallbackResult("accepted"))
     assert adapter._serialize_card_action_response(response)["toast"]["content"] == "accepted"
-    adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=SimpleNamespace(patch=object()))))
-    adapter._run_blocking = AsyncMock(return_value=object())
+    adapter._client = object()
+    adapter._card_message_request = AsyncMock(return_value=object())
     adapter._finalize_send_result = lambda *_: SendResult(True)
     result = await adapter.patch_interactive_message(message_id="card", card={"schema": "2.0"})
     assert result.success and result.message_id == "card"
+
+
+@pytest.mark.asyncio
+async def test_card_total_budget_closes_real_stalled_http_connection(adapter, monkeypatch):
+    """Exercise SDK auth and message HTTP over a local socket, including cancellation cleanup."""
+    monkeypatch.setenv('NO_PROXY', '127.0.0.1')
+    pending = set()
+    requested, disconnected = asyncio.Event(), asyncio.Event()
+    async def serve(reader, writer):
+        pending.add(asyncio.current_task())
+        try:
+            header = await reader.readuntil(b'\r\n\r\n')
+            fields = dict(line.split(b':', 1) for line in header.split(b'\r\n')[1:] if b':' in line)
+            size = int(fields.get(b'Content-Length', fields.get(b'content-length', b'0')))
+            await reader.readexactly(size)
+            if b'tenant_access_token' in header.split(b'\r\n')[0]:
+                body = json.dumps({'code': 0, 'tenant_access_token': 'test-token', 'expire': 7200}).encode()
+                writer.write(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: '
+                             + str(len(body)).encode() + b'\r\n\r\n' + body)
+                await writer.drain()
+            else:
+                requested.set()
+                assert await reader.read() == b''
+                disconnected.set()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            pending.discard(asyncio.current_task())
+    server = await asyncio.start_server(serve, '127.0.0.1', 0)
+    adapter._client = module._build_lark_client('test-app', 'test-secret',
+        f'http://127.0.0.1:{server.sockets[0].getsockname()[1]}')
+    adapter.card_io_timeout = 2
+    operation = asyncio.create_task(adapter.patch_interactive_message(message_id='card', card={'schema': '2.0'}))
+    try:
+        await asyncio.wait_for(requested.wait(), 5)
+        result = await asyncio.wait_for(operation, 5)
+        assert not result.success
+        await asyncio.wait_for(disconnected.wait(), 5)
+    finally:
+        operation.cancel()
+        await asyncio.gather(operation, return_exceptions=True)
+        server.close()
+        await server.wait_closed()
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)

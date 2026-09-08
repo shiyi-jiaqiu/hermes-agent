@@ -159,12 +159,18 @@ class FeishuProgress:
         self._finish_sent = True
         events.put({"type": "turn.finished", "status": status})
 
+    def stop(self):
+        """Seal publication immediately; an in-flight transport still owns its cleanup."""
+        self._closed = True
+        self._started.clear()
+        self._snapshots.clear()
+
     async def send_events(self, events, *, reply_to, metadata, on_delivery):
         last_attempt = 0.0
         dirty = False
         failed = False
         try:
-            while self.state.status == "working":
+            while not self._closed and self.state.status == "working":
                 for _ in range(64):
                     try:
                         event = events.get_nowait()
@@ -193,6 +199,8 @@ class FeishuProgress:
                     else:
                         result = await self.adapter.send_coding_progress_card(self.source.chat_id, card,
                                                                              reply_to=reply_to, metadata=metadata)
+                    if self._closed:
+                        return
                     if result.success and (self._message_id or result.message_id):
                         if self._message_id is None:
                             self._message_id = result.message_id
@@ -211,6 +219,4 @@ class FeishuProgress:
             # Presentation failures must never prevent tools or the final answer.
             logger.exception("Native progress sender failed")
         finally:
-            self._closed = True
-            self._started.clear()
-            self._snapshots.clear()
+            self.stop()

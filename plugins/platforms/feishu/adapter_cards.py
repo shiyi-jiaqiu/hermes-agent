@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -13,6 +14,8 @@ logger = logging.getLogger(__name__)
 
 
 class FeishuCardsMixin:
+    card_io_timeout = 5.0
+
     def create_tool_progress(self, source, config):
         from gateway.display_config import resolve_display_setting
         from .progress.sender import FeishuProgress
@@ -20,16 +23,34 @@ class FeishuCardsMixin:
             return FeishuProgress(self, source, config)
         return None
 
-    @staticmethod
-    async def _card_io(operation):
-        # Cancellation stops publication but cannot stop an SDK worker already in I/O.
-        # Join that worker before Panel.close releases its sending resources.
-        task = asyncio.create_task(operation)
+    async def _card_io(self, operation):
+        # Includes async token acquisition, thread lookup, retry backoff and delivery.
+        # SDK async HTTP owns/closes its client on cancellation; there is no worker to join.
         try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            await asyncio.gather(task, return_exceptions=True)
-            raise
+            async with asyncio.timeout(self.card_io_timeout):
+                return await operation
+        except TimeoutError as exc:
+            raise TimeoutError(f"Card I/O exceeded its {self.card_io_timeout:g}s total budget") from exc
+
+    async def _card_message_request(self, name, request):
+        from lark_oapi import RequestOption
+        from lark_oapi.api.auth.v3 import InternalTenantAccessTokenRequest, InternalTenantAccessTokenRequestBody
+        # SDK async message methods still run synchronous token discovery unless an
+        # explicit token is supplied. Acquire it asynchronously under the same budget.
+        async with self._card_token_lock:
+            if time.monotonic() >= self._card_token_expires:
+                body = InternalTenantAccessTokenRequestBody.builder().app_id(self._app_id).app_secret(self._app_secret).build()
+                token_request = InternalTenantAccessTokenRequest.builder().request_body(body).build()
+                response = await self._client.auth.v3.tenant_access_token.ainternal(token_request)
+                # This SDK response exposes token fields only in its raw JSON body.
+                payload = json.loads(response.raw.content)
+                if not response.success() or not payload.get("tenant_access_token"):
+                    raise RuntimeError("Feishu card authentication failed")
+                self._card_token = payload["tenant_access_token"]
+                self._card_token_expires = time.monotonic() + max(0, payload["expire"] - 60)
+            token = self._card_token
+        option = RequestOption.builder().tenant_access_token(token).build()
+        return await getattr(self._client.im.v1.message, "a" + name)(request, option)
 
     async def send_coding_progress_card(self, chat_id, card, *, reply_to=None, metadata=None):
         if not self._client:
@@ -37,7 +58,7 @@ class FeishuCardsMixin:
         try:
             response = await self._card_io(self._feishu_send_with_retry(
                 chat_id=chat_id, msg_type="interactive", payload=json.dumps(card, ensure_ascii=False),
-                reply_to=reply_to, metadata=metadata))
+                reply_to=reply_to, metadata=metadata, message_call=self._card_message_request))
             return self._finalize_send_result(response, "interactive card send failed")
         except Exception as exc:
             logger.warning("Feishu card send failed: %s", exc)
@@ -50,7 +71,7 @@ class FeishuCardsMixin:
         try:
             body = PatchMessageRequestBody.builder().content(json.dumps(card, ensure_ascii=False)).build()
             request = PatchMessageRequest.builder().message_id(message_id).request_body(body).build()
-            response = await self._card_io(self._run_blocking(self._client.im.v1.message.patch, request))
+            response = await self._card_io(self._card_message_request("patch", request))
             result = self._finalize_send_result(response, "interactive card update failed")
             if result.success:
                 result.message_id = message_id

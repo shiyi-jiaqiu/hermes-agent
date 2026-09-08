@@ -160,3 +160,46 @@ async def test_redactor_failure_stops_only_presentation(monkeypatch):
     progress.finish(events, "finished")
     await progress.send_events(events, reply_to=None, metadata=None, on_delivery=lambda result: None)
     assert not progress.adapter.cards and progress._closed
+
+
+@pytest.mark.asyncio
+async def test_turn_cleanup_budget_releases_session_and_rejects_late_delivery(monkeypatch):
+    from types import SimpleNamespace
+    from gateway.run import GatewayRunner
+    import gateway.run_turn as turn_module
+    started, release = asyncio.Event(), asyncio.Event()
+    class StalledAdapter:
+        async def send_coding_progress_card(self, *args, **kwargs):
+            started.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    pass
+            return SendResult(True, message_id='late')
+    progress = FeishuProgress(StalledAdapter(), SOURCE, CONFIG)
+    events = queue.Queue()
+    progress.start(events, 'id', 'terminal', {'command': 'true'})
+    delivered = []
+    sender = asyncio.create_task(progress.send_events(events, reply_to=None, metadata=None, on_delivery=delivered.append))
+    await started.wait()
+    runner = object.__new__(GatewayRunner)
+    runner._draining = False
+    released = []
+    runner._release_running_agent_state = lambda *a, **kw: released.append(kw)
+    tracking = asyncio.create_task(asyncio.sleep(30))
+    ctx = SimpleNamespace(native_progress=progress, progress_outcome='finished', progress_queue=events,
+                          session_key='key', run_generation=1, stream_consumer_holder=[None],
+                          streaming_tts_consumer_holder=[None])
+    monkeypatch.setattr(turn_module, '_PROGRESS_FINALIZE_TIMEOUT', .01, raising=False)
+    cleanup = asyncio.create_task(runner._run_agent_cleanup_turn_tasks(
+        ctx, progress_task=sender, log_task=None, interrupt_monitor=None, _notify_task=None,
+        tracking_task=tracking, stream_task=None))
+    try:
+        done, _ = await asyncio.wait({cleanup}, timeout=2)
+        assert done and released
+        assert progress._closed and sender in runner._background_tasks
+    finally:
+        release.set()
+        await asyncio.gather(cleanup, sender, tracking, return_exceptions=True)
+    assert not delivered and progress._message_id is None

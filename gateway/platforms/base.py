@@ -1826,7 +1826,7 @@ class BasePlatformAdapter(ABC):
         return SendResult(success=False, error="Interactive control panels are not available on this platform")
 
     def create_tool_progress(self, source, config):
-        """Optional per-turn native progress consumer (start, complete, finish, send_events)."""
+        """Optional native consumer: start/complete, finish, send_events and stop (seal publication)."""
         return None
 
     def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
