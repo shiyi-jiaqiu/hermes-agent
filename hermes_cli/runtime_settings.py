@@ -24,6 +24,7 @@ class RuntimeSettings:
     capabilities: dict | None = field(default=None, repr=False, compare=False)
     reasoning_inherited: bool = False
     runtime_resolved: bool = field(default=True, compare=False, repr=False)
+    temporary: bool = False
 
     def persisted(self) -> dict:
         return {k: getattr(self, k) for k in
@@ -53,16 +54,20 @@ class SettingsResult:
     actual: RuntimeSettings
     applied: bool
     error: str = ""
+    changed: bool = True
 
     def text(self) -> str:
         if not self.applied:
             return f"Settings unchanged: {self.error}"
+        if not self.changed:
+            return "Settings already active; no changes needed"
         return (f"Settings saved for the next turn: {self.actual.model} ({self.actual.provider}) · "
                 f"Reasoning {self.actual.reasoning} · {self.actual.service_tier}")
 
 
 class SettingsEndpoint(Protocol):
     def read(self) -> RuntimeSettings: ...
+    def validate(self) -> None: ...
     def persist(self, settings: RuntimeSettings) -> None: ...
     def publish(self, settings: RuntimeSettings) -> None: ...
 
@@ -70,7 +75,7 @@ class SettingsEndpoint(Protocol):
 def prepare_settings(current: RuntimeSettings, request: SettingsRequest, config: dict,
                      *, resolver: Callable | None = None) -> RuntimeSettings:
     """Resolve the original alias (including its endpoint), then validate all fields."""
-    target = current
+    target = replace(current, temporary=False)
     if request.model_target is not None:
         from hermes_cli.config import get_compatible_custom_providers
         from hermes_cli.model_switch import switch_model
@@ -91,7 +96,7 @@ def prepare_settings(current: RuntimeSettings, request: SettingsRequest, config:
         runtime = resolve_runtime_provider(requested=current.provider or None,
                                            explicit_base_url=current.base_url or None,
                                            target_model=current.model or None)
-        target = replace(current, model=runtime.get("model") or current.model,
+        target = replace(target, model=runtime.get("model") or current.model,
                          provider=current.provider or runtime.get("provider") or "",
                          base_url=runtime.get("base_url") or "", api_mode=current.api_mode or runtime.get("api_mode") or "",
                          api_key=runtime.get("api_key") or "", request_overrides=runtime.get("request_overrides"),
@@ -121,17 +126,44 @@ def prepare_settings(current: RuntimeSettings, request: SettingsRequest, config:
     return target
 
 
+def same_runtime(left: RuntimeSettings, right: RuntimeSettings) -> bool:
+    """Include resolved credentials/capabilities as well as durable values and provenance."""
+    return (left == right and left.route() == right.route()
+            and left.runtime_resolved == right.runtime_resolved)
+
+
+def needs_persistence(current: RuntimeSettings, target: RuntimeSettings) -> bool:
+    return (current.persisted() != target.persisted() or not current.runtime_resolved or current.temporary)
+
+
+def unchanged_result(current: RuntimeSettings, baseline: RuntimeSettings,
+                     target: RuntimeSettings) -> SettingsResult | None:
+    """Shared commit decision for synchronous and asynchronous storage bindings."""
+    if not same_runtime(current, baseline):
+        return SettingsResult(current, False, "Settings changed during resolution; retry the selection")
+    if same_runtime(current, target):
+        return SettingsResult(current, True, changed=False)
+    return None
+
+
+def settings_error(exc: Exception) -> str:
+    from agent.redact import redact_sensitive_text
+    return redact_sensitive_text(str(exc), force=True, redact_url_credentials=True) or type(exc).__name__
+
+
 def commit_settings(endpoint: SettingsEndpoint, baseline: RuntimeSettings,
                     target: RuntimeSettings) -> SettingsResult:
     """Called by the endpoint's owner, with no await between comparison and publish."""
     current = endpoint.read()
-    if current != baseline:
-        return SettingsResult(current, False, "Settings changed during resolution; retry the selection")
     try:
-        endpoint.persist(target)
+        endpoint.validate()
+        unchanged = unchanged_result(current, baseline, target)
+        if unchanged is not None:
+            return unchanged
+        if needs_persistence(current, target):
+            endpoint.persist(target)
     except Exception as exc:
-        from agent.redact import redact_sensitive_text
-        return SettingsResult(endpoint.read(), False, redact_sensitive_text(str(exc), force=True, redact_url_credentials=True))
+        return SettingsResult(endpoint.read(), False, settings_error(exc))
     endpoint.publish(target)  # local assignments only; all fallible work precedes this point
     return SettingsResult(target, True)
 
@@ -141,8 +173,7 @@ def apply_settings(endpoint: SettingsEndpoint, request: SettingsRequest, config:
     try:
         target = prepare_settings(baseline, request, config, resolver=resolver)
     except Exception as exc:
-        from agent.redact import redact_sensitive_text
-        return SettingsResult(endpoint.read(), False, redact_sensitive_text(str(exc), force=True, redact_url_credentials=True))
+        return SettingsResult(endpoint.read(), False, settings_error(exc))
     return commit_settings(endpoint, baseline, target)
 
 
@@ -175,15 +206,12 @@ def parse_mode_command(command: str) -> tuple[str, str]:
     return words[0].lower(), words[1].lower() if len(words) == 2 else ""
 
 
-async def prepare_settings_async(current, request, config, *, resolver=None):
-    """Cancellation stops publication, but joins the owned resolver thread first."""
+async def prepare_settings_async(current, request, config, *, retain, resolver=None):
+    """Resolution owns only its inputs; leaving the UI never publishes its eventual result."""
     import asyncio
-    task = asyncio.create_task(asyncio.to_thread(prepare_settings, current, request, config, resolver=resolver))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        await asyncio.gather(task, return_exceptions=True)
-        raise
+    task = retain(asyncio.create_task(asyncio.to_thread(prepare_settings, current, request, config, resolver=resolver)))
+    task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+    return await asyncio.shield(task)
 
 
 def stored_settings(row: dict | None) -> dict | None:

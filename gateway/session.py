@@ -1053,16 +1053,25 @@ class SessionStore(
         """
         return self._update_entry(session_key, lambda e: e.metadata.__setitem__(key, value))
 
+    def matches_session(self, session_key: str, session_id: str) -> bool:
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            return entry is not None and entry.session_id == session_id
+
     def set_runtime_settings(self, session_key: str, settings: dict, *, session_id: str) -> None:
         """Commit in the owning session DB before publishing the in-memory route."""
         with self._lock:
             entry = self._entry_locked(session_key)
             if entry is None or entry.session_id != session_id:
                 raise ValueError("Session changed during settings resolution")
-            db = self._db_for_key(session_key)
-            if db is None:
-                raise RuntimeError("Session database is unavailable")
-            db.update_runtime_settings(session_id, settings)
+        db = self._db_for_key(session_key)
+        if db is None:
+            raise RuntimeError("Session database is unavailable")
+        # SQLite may wait for another writer. Never hold the routing-index lock during I/O.
+        db.update_runtime_settings(session_id, settings)
+        with self._lock:
+            if self._entry_locked(session_key) is not entry or entry.session_id != session_id:
+                raise ValueError("Session changed during settings commit")
             entry.was_auto_reset = False
             entry.model_override = {
                 key: settings[key] for key in ("model", "provider", "base_url", "api_mode")}
@@ -1072,10 +1081,11 @@ class SessionStore(
             entry = self._entry_locked(session_key)
             if entry is None:
                 return None
-            db = self._db_for_key(session_key)
-            if db is None:
-                return None
-            return db.get_runtime_settings(entry.session_id)
+            session_id = entry.session_id
+        db = self._db_for_key(session_key)
+        if db is None:
+            return None
+        return db.get_runtime_settings(session_id)
 
     def set_model_override(self, session_key: str, override: Optional[Dict[str, Any]]) -> None:
         """Persist (or clear, with ``None``) the /model override; non-secret keys only."""

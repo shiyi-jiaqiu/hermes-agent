@@ -38,6 +38,10 @@ class _StubCLI:
         import cli as _cli_mod
         return _cli_mod.HermesCLI._stage_and_swap_model(self, result, old_model)
 
+    def __init__(self):
+        from cli import HermesCLI
+        HermesCLI._init_prompt_and_reasoning(self, None)
+
     model = "old/model"
     provider = "openrouter"
     requested_provider = "openrouter"

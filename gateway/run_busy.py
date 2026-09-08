@@ -171,6 +171,9 @@ class GatewayBusySessionMixin:
         self, session_key: str, source: SessionSource
     ) -> tuple[Any, Optional[str]]:
         """Claim a cross-process active-session slot for a new gateway turn."""
+        pending = self._session_state(session_key).persistent
+        if pending.settings_lock.locked() or pending.settings_commit is not None:
+            return None, "Session settings are being committed or the session is changing; retry shortly"
         if self._is_session_running(session_key):
             return None, None
         limit_message = self._active_session_limit_message(session_key)

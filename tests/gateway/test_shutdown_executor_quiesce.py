@@ -40,6 +40,7 @@ class _FakeGateway:
 
     def __init__(self, events):
         self._events = events
+        self._sessions = {}
         self._running = True
         self._draining = False
         self._restart_requested = False
@@ -71,6 +72,9 @@ class _FakeGateway:
         self.session_store = None
 
     # -- shutdown collaborators the real stop() reaches into ---------------
+
+    def _sessions_map(self):
+        return self._sessions
 
     def _running_agent_count(self):
         return len(self._running_agents)

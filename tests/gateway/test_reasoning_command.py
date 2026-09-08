@@ -49,6 +49,8 @@ def _make_runner():
     runner.hooks.emit = AsyncMock()
     runner.hooks.loaded_hooks = []
     runner._session_db = None
+    runner.session_store = types.SimpleNamespace(get_runtime_settings=lambda key: None,
+                                                get_model_override=lambda key: None)
     runner._get_or_create_gateway_honcho = lambda session_key: (None, None)
     return runner
 

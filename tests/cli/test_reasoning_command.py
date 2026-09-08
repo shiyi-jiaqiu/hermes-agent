@@ -104,6 +104,9 @@ class TestHandleReasoningCommand(unittest.TestCase):
         db = SessionDB(db_path=Path(directory.name) / "state.db")
         self.addCleanup(db.close)
         stub.session_id, stub._session_db = "settings", db
+        stub._pending_one_turn_model_restore = None
+        stub._settings_reasoning_inherited = False
+        stub._settings_request_overrides = stub._settings_capabilities = None
         stub.model, stub.provider = "gpt-5.4", "openai-codex"
         stub.base_url, stub.api_mode, stub.api_key = "", "codex_responses", ""
         stub.service_tier = getattr(stub, "service_tier", None)

@@ -142,7 +142,7 @@ def _commit_model_switch(
     """Stage + swap, print the summary, persist (session row unless --once; config on --global).
     ``picker``: tolerate context-resolution errors and label the config write "(--global)"; the
     typed path additionally records the one-turn restore snapshot."""
-    from cli import HermesCLI, _cprint
+    from cli import _cprint
     if not one_turn:
         old_model = cli.model
         from hermes_cli.config import load_config
@@ -151,7 +151,7 @@ def _commit_model_switch(
         applied = apply_cli_settings(cli, SettingsRequest(result.new_model, result.target_provider),
                                  load_config(), resolver=lambda **kwargs: result)
         _cprint(applied.text())
-        if applied.applied:
+        if applied.applied and applied.changed:
             _print_switch_summary(cli, result, old_model, one_turn=False, strict_context=False)
         if applied.applied and persist_global:
             try:
@@ -162,23 +162,17 @@ def _commit_model_switch(
                 _cprint("Saved to config.yaml (--global)")
         return
     old_model = cli.model
-    snapshot = cli._snapshot_model_runtime() if one_turn else None
+    snapshot = cli._snapshot_model_runtime()
     if not cli._stage_and_swap_model(result, old_model):
         return
     if not picker:
         cli._pending_one_turn_model_restore = snapshot
-    _print_switch_summary(cli, result, old_model, one_turn=one_turn, strict_context=not picker)
+    _print_switch_summary(cli, result, old_model, one_turn=True, strict_context=not picker)
     if persist_global:
         _persist_global_switch(cli, result)
         _cprint("    Saved to config.yaml (--global)" if picker else "    Saved to config.yaml")
-    elif one_turn:
-        _cprint("    (next turn only — restores after one response)")
     else:
-        _cprint("    (session only — add --global to persist)")
-    # The row records what THIS session runs even on --global (else a later resume restores the
-    # stale creation-time model); --once is restored after one turn and never touches the row.
-    if not one_turn:
-        HermesCLI._persist_model_switch_to_session(cli, result)
+        _cprint("    (next turn only — restores after one response)")
 
 
 def _persist_global_switch(cli, result) -> None:
@@ -385,7 +379,9 @@ class CLIModelSwitchMixin:
             settings = RuntimeSettings(**saved, api_key=runtime.get("api_key") or "",
                                        request_overrides=runtime.get("request_overrides"),
                                        capabilities=runtime.get("capabilities"))
-            CLISettingsEndpoint(self).publish(settings)
+            endpoint = CLISettingsEndpoint(self)
+            endpoint.publish(settings)
+            endpoint.release_retired()
             self._credential_pool = runtime.get("credential_pool")
             return
         # Canonical row reader: model_config.gateway_runtime, else the TUI's top-level keys.

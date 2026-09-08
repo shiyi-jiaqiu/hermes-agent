@@ -399,11 +399,12 @@ class GatewayModelCommandsMixin:
                     return applied.text() + " Global configuration write failed."
                 return applied.text() + " Global default saved."
             return applied.text()
-        error = self._switch_cached_agent_model(result, ctx, picker)
-        if error is not None:
-            return error
-        await self._record_model_switch(result, ctx, source=source, one_turn=one_turn, picker=picker)
-        return await self._model_switch_confirmation(result, ctx, one_turn=one_turn, picker=picker)
+        async with self._session_state(ctx.session_key).persistent.settings_lock:
+            error = self._switch_cached_agent_model(result, ctx, picker)
+            if error is not None:
+                return error
+            await self._record_model_switch(result, ctx, source=source, one_turn=one_turn, picker=picker)
+            return await self._model_switch_confirmation(result, ctx, one_turn=one_turn, picker=picker)
 
     async def _send_model_picker(self, event: MessageEvent, source, adapter, session_key: str, listing_kwargs: dict, on_model_selected) -> bool:
         """Send the interactive /model picker; False when nothing was sent (text fallback). *source*

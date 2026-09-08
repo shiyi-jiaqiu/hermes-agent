@@ -1858,6 +1858,11 @@ class GatewayShutdownMixin:
             await GatewayRunner._stop_drain_active_work(self, timeout, ctx)
             if ctx.timed_out:
                 await GatewayRunner._stop_interrupt_remaining_work(self, ctx)
+            # Durable settings commits own their DB handles until publication. Unlike
+            # optional UI work, they must settle before the handle sweep.
+            commits = [state.persistent.settings_commit for state in self._sessions_map().values()
+                       if state.persistent.settings_commit is not None]
+            await asyncio.gather(*(asyncio.shield(task) for task in commits), return_exceptions=True)
             await GatewayRunner._stop_finalize_agents_and_adapters(self, ctx)
             GatewayRunner._stop_release_runtime_state(self, ctx)
             GatewayRunner._stop_quiesce_and_close_session_dbs(self, timeout, ctx)

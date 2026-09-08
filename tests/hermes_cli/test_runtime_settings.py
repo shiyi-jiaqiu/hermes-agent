@@ -20,6 +20,9 @@ class Endpoint:
     def read(self):
         return self.settings
 
+    def validate(self):
+        pass
+
     def persist(self, settings):
         self.db.update_runtime_settings("session", settings.persisted())
 
@@ -137,3 +140,61 @@ def test_initial_tuning_resolves_full_route_before_commit(endpoint, monkeypatch)
     assert endpoint.db.get_runtime_settings("session")["base_url"] == "https://proxy.test/v1"
     assert calls[0]["explicit_base_url"] == "https://proxy.test/v1"
     assert calls[0]["target_model"] == "old"
+
+
+@pytest.mark.parametrize('reasoning, expected', [(None, 'high'), ('low', 'low'), ('invalid', 'high')])
+def test_cli_initial_reasoning_preserves_source_when_switching_model(monkeypatch, reasoning, expected):
+    from types import SimpleNamespace
+    import cli as cli_module
+    from hermes_cli.settings_endpoint import CLISettingsEndpoint
+    cfg = {'agent': {'reasoning_overrides': {'model-a': 'low', 'model-b': 'high'}}}
+    monkeypatch.setattr(cli_module, 'CLI_CONFIG', cfg)
+    cli = SimpleNamespace(model='model-a', provider='p', base_url='', api_mode='', api_key='', session_id='s')
+    cli_module.HermesCLI._init_prompt_and_reasoning(cli, reasoning)
+    target = prepare_settings(CLISettingsEndpoint(cli).read(), SettingsRequest(model_target='model-b'), cfg,
+                              resolver=lambda **kw: ModelSwitchResult(True, 'model-b', 'p'))
+    assert target.reasoning == expected
+    assert target.reasoning_inherited is (reasoning != 'low')
+
+
+def test_unchanged_settings_skip_storage_but_runtime_and_source_changes_publish(endpoint):
+    initial = endpoint.read()
+    endpoint.db._execute_write(lambda conn: conn.execute(
+        "CREATE TRIGGER deny_noop BEFORE UPDATE ON sessions BEGIN SELECT RAISE(ABORT, 'unnecessary write'); END"))
+    result = commit_settings(endpoint, initial, replace(initial))
+    assert result.applied and endpoint.published == 0
+    for changes in ({'api_key': 'rotated'}, {'capabilities': {'reasoning': True}},
+                    {'request_overrides': {'x': 1}}, {'reasoning_inherited': True}):
+        if 'reasoning_inherited' in changes:
+            endpoint.db._execute_write(lambda conn: conn.execute('DROP TRIGGER deny_noop'))
+        before = endpoint.read()
+        result = commit_settings(endpoint, before, replace(before, **changes))
+        assert result.applied
+    assert endpoint.published == 4
+
+
+def test_cli_noop_keeps_agent_and_real_replacement_only_releases_clients(endpoint, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    import cli as cli_module
+    from hermes_cli.settings_endpoint import apply_cli_settings
+    cfg = {'agent': {}}
+    monkeypatch.setattr(cli_module, 'CLI_CONFIG', cfg)
+    retired = SimpleNamespace(release_clients=Mock(), cleanup=Mock())
+    current = endpoint.read()
+    cli = SimpleNamespace(**current.route(), session_id='session', agent=retired, _session_db=endpoint.db,
+                          _agent_running=False)
+    cli_module.HermesCLI._init_prompt_and_reasoning(cli, None)
+    result = apply_cli_settings(cli, SettingsRequest(), cfg)
+    assert result.applied and not result.changed and cli.agent is retired
+    retired.release_clients.assert_not_called()
+    result = apply_cli_settings(cli, SettingsRequest(model_target='new'), cfg,
+                               resolver=lambda **kw: ModelSwitchResult(True, 'new', 'p'))
+    assert result.applied and result.changed and cli.agent is None
+    retired.release_clients.assert_called_once_with()
+    retired.cleanup.assert_not_called()
+    cli.agent = retired
+    cli._pending_one_turn_model_restore = {'model': 'previous'}
+    result = apply_cli_settings(cli, SettingsRequest(), cfg)
+    assert result.applied and result.changed and cli._pending_one_turn_model_restore is None
+    assert retired.release_clients.call_count == 2

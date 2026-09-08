@@ -39,9 +39,10 @@ class _TUISettingsEndpoint:
                                reasoning_name(rc), tier or "normal", field("api_key"),
                                route.get("request_overrides"), route.get("capabilities"),
                                session.get("create_reasoning_override") is None,
-                               runtime_resolved=bool(agent or route))
+                               runtime_resolved=bool(agent or route),
+                               temporary=session.get("one_turn_model_restore") is not None)
 
-    def persist(self, settings):
+    def validate(self):
         session = self.session
         if _sessions.get(self.sid) is not session or session["session_key"] != self.key:
             raise ValueError("Session changed during settings resolution")
@@ -50,6 +51,9 @@ class _TUISettingsEndpoint:
         ready = session.get("agent_ready")
         if ready is not None and not ready.is_set() and session.get("agent_build_started"):
             raise ValueError("Agent is initializing; retry after it is ready")
+
+    def persist(self, settings):
+        session = self.session
         with _session_db(session) as db:
             if db is None:
                 raise RuntimeError("Session database is unavailable")
@@ -85,21 +89,19 @@ class _TUISettingsEndpoint:
 
 
 def _apply_session_settings(sid, session, request, cfg, *, resolver=None):
-    from hermes_cli.runtime_settings import SettingsResult, commit_settings, prepare_settings
-    from agent.redact import redact_sensitive_text
+    from hermes_cli.runtime_settings import SettingsResult, commit_settings, prepare_settings, settings_error
     endpoint = _TUISettingsEndpoint(sid, session)
     with _session_profile_runtime_scope(session):
         baseline = endpoint.read()
         try:
             candidate = prepare_settings(baseline, request, cfg, resolver=resolver)
         except Exception as exc:
-            return SettingsResult(endpoint.read(), False,
-                                  redact_sensitive_text(str(exc), force=True, redact_url_credentials=True))
+            return SettingsResult(endpoint.read(), False, settings_error(exc))
         # Serialize publication with prompt claims, teardown and agent initialization.
         with _sessions_lock, session["history_lock"], session.setdefault("agent_build_lock", threading.Lock()):
             result = commit_settings(endpoint, baseline, candidate)
         endpoint.release_retired()
-        if result.applied:
+        if result.applied and result.changed:
             _emit("session.info", sid, _session_info(None, session))
         return result
 

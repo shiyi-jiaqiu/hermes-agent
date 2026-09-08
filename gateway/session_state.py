@@ -5,6 +5,8 @@ was CLEARED: ``turn`` at the end of every turn; ``conversation`` at conversation
 
 from __future__ import annotations
 
+import asyncio
+
 from collections.abc import MutableMapping
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple
@@ -58,6 +60,8 @@ class PersistentState:
     """State with its own lifecycle — NOT cleared wholesale by turn or boundary resets
     (approvals/update prompts ARE cleared, individually, by the boundary security funnel)."""
 
+    settings_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    settings_commit: Optional[asyncio.Task] = field(default=None, repr=False)
     approvals: Optional[Dict[str, Any]] = None  # {"command": ..., "pattern_key": ...}
     update_prompt_pending: bool = False  # /update prompt awaiting a reply
     native_image_paths: List[str] = field(default_factory=list)  # consumed one-shot
