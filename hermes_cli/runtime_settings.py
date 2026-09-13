@@ -10,6 +10,18 @@ from dataclasses import dataclass, field, replace
 from typing import Callable, Protocol
 
 
+def durable_provider_identity(provider: str, *, base_url: str = "", model: str = "") -> str:
+    """Return the non-secret route identity that can re-resolve custom credentials."""
+    if str(provider or "").strip().lower() != "custom":
+        return provider
+    try:
+        from hermes_cli.runtime_provider import canonical_custom_identity
+        return canonical_custom_identity(
+            base_url=base_url or None, model=model or None) or provider
+    except Exception:
+        return provider
+
+
 @dataclass(frozen=True)
 class RuntimeSettings:
     model: str
@@ -27,8 +39,16 @@ class RuntimeSettings:
     temporary: bool = False
 
     def persisted(self) -> dict:
-        return {k: getattr(self, k) for k in
-                ("model", "provider", "base_url", "api_mode", "reasoning", "service_tier", "reasoning_inherited")}
+        # ``custom`` is a resolved billing class, not a durable route identity.
+        # Persist the configured endpoint owner so a fresh process can reload its
+        # key_env/key_cmd without ever storing the credential itself.
+        provider = durable_provider_identity(
+            self.provider, base_url=self.base_url, model=self.model)
+        return {
+            "provider": provider,
+            **{k: getattr(self, k) for k in
+               ("model", "base_url", "api_mode", "reasoning", "service_tier", "reasoning_inherited")},
+        }
 
 
     def route(self) -> dict:
@@ -222,8 +242,12 @@ def stored_settings(row: dict | None) -> dict | None:
         raw = json.loads(raw)
     if not isinstance(raw, dict) or not raw.get("settings_override"):
         return None
-    return {"model": (row or {}).get("model") or raw.get("model") or "",
-            **{k: raw.get(k) or "" for k in ("provider", "base_url", "api_mode")},
+    model = (row or {}).get("model") or raw.get("model") or ""
+    base_url = raw.get("base_url") or ""
+    provider = durable_provider_identity(
+        raw.get("provider") or "", base_url=base_url, model=model)
+    return {"model": model, "provider": provider, "base_url": base_url,
+            "api_mode": raw.get("api_mode") or "",
             "reasoning": reasoning_name(raw.get("reasoning_config")),
             "service_tier": raw.get("service_tier") or "normal",
             "reasoning_inherited": bool(raw.get("reasoning_inherited"))}

@@ -11,8 +11,12 @@ id stability, and the startup redelivery sweep's contract:
 
 import os
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -93,6 +97,69 @@ def _orphan(oid):
             "owner_started_at=1 WHERE obligation_id=?",
             (oid,),
         )
+
+
+def _main_db_locks(path: Path) -> set[tuple[str, ...]]:
+    if not sys.platform.startswith("linux"):
+        pytest.skip("lock-table probe requires /proc/locks")
+    inode = path.stat().st_ino
+    held = set()
+    for line in Path("/proc/locks").read_text().splitlines():
+        parts = line.split()
+        try:
+            owner = int(parts[4])
+            locked_inode = int(parts[5].split(":")[2])
+        except (IndexError, ValueError):
+            continue
+        if owner == os.getpid() and locked_inode == inode:
+            held.add(tuple(parts[1:8]))
+    return held
+
+
+def test_ledger_transaction_borrows_live_writer_without_losing_wal_generation():
+    """The gateway ledger must not open+close a second writable state.db connection."""
+    from hermes_state_registry import acquire, close_all
+
+    path = dl._db_path()
+    db = acquire(path)
+    try:
+        db.create_session("live", source="cli")
+        wal = Path(str(path) + "-wal")
+        identity = (wal.stat().st_dev, wal.stat().st_ino)
+        before = _main_db_locks(path)
+        assert before
+
+        # Startup sweeps run in the gateway's executor, not on the thread that
+        # constructed the long-lived SessionDB.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(_record).result()
+
+        after = _main_db_locks(path)
+        assert not (before - after), "delivery ledger cancelled the gateway's DMS lock"
+        subprocess.run(
+            [sys.executable, "-c", "import sqlite3,sys; sqlite3.connect(sys.argv[1]).execute('SELECT 1').fetchone()", str(path)],
+            check=True,
+        )
+        assert wal.exists()
+        assert (wal.stat().st_dev, wal.stat().st_ino) == identity
+        db.append_message("live", role="user", content="post-ledger")
+    finally:
+        close_all()
+
+
+def test_ledger_transaction_uses_registry_connection():
+    """The deterministic lifecycle seam: no private sqlite connection may be opened."""
+    from hermes_state_registry import acquire, close_all, stats
+
+    db = acquire(dl._db_path())
+    try:
+        assert stats()["total_refcounts"] == 1
+        with dl._transaction() as conn:
+            assert conn is db._conn
+            assert stats()["total_refcounts"] == 2
+        assert stats()["total_refcounts"] == 1
+    finally:
+        close_all()
 
 
 class TestSchemaMigration:

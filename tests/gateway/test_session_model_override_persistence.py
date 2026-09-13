@@ -142,6 +142,49 @@ def test_runner_rehydrates_override_after_restart(store_factory):
     assert route["runtime"]["capabilities"] == {"openai_native_compaction": True}
 
 
+def test_runner_rehydrates_legacy_bare_custom_through_named_identity(store_factory):
+    """A pre-fix ``provider=custom`` row must recover the configured credential owner.
+
+    Persisting the secret is forbidden.  The durable endpoint/model identity is enough to
+    recover ``custom:<name>`` before runtime resolution, which in turn reloads ``key_env``.
+    Passing bare ``custom`` straight to the resolver sends ``no-key-required`` to an
+    authenticated loopback proxy after /resume.
+    """
+    store = store_factory()
+    entry = store.get_or_create_session(_make_source())
+    session_key = entry.session_key
+    store.set_model_override(session_key, {
+        "model": "local-flash",
+        "provider": "custom",
+        "base_url": "http://127.0.0.1:8317/v1",
+        "api_mode": "chat_completions",
+    })
+
+    runner = _make_runner(store_factory())
+    with patch(
+        "hermes_cli.runtime_provider.canonical_custom_identity",
+        return_value="custom:cliproxy",
+    ) as canonical, patch(
+        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+        return_value={
+            "api_key": "sk-fresh-from-env",
+            "api_mode": "chat_completions",
+            "base_url": "http://127.0.0.1:8317/v1",
+            "provider": "custom",
+            "requested_provider": "custom:cliproxy",
+        },
+    ) as resolve:
+        runner._rehydrate_session_model_override(session_key)
+
+    canonical.assert_called_once_with(
+        base_url="http://127.0.0.1:8317/v1", model="local-flash")
+    resolve.assert_called_once_with(
+        "custom:cliproxy", base_url="http://127.0.0.1:8317/v1", model="local-flash")
+    restored = runner._session_model_overrides[session_key]
+    assert restored["provider"] == "custom:cliproxy"
+    assert restored["api_key"] == "sk-fresh-from-env"
+
+
 def test_sanitize_model_override():
     assert sanitize_model_override(None) is None
     assert sanitize_model_override({}) is None

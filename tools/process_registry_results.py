@@ -70,13 +70,16 @@ def _owns_result(owner: str, parent: str | None) -> bool:
         return False
     if owner == parent:
         return True
-    from hermes_state import SessionDB
+    from hermes_state_registry import acquire, release_or_close
 
-    db = SessionDB()
+    # This runs inside the gateway when terminal results are queried.  Borrow its
+    # writer: closing a second writable connection can cancel the gateway's POSIX
+    # DMS lock and let a peer unlink the live WAL generation.
+    db = acquire()
     try:
         return db.get_compression_tip(parent) == owner
     finally:
-        db.close()
+        release_or_close(db)
 
 
 def load_completed_results(prefix: str = "") -> dict:

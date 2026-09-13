@@ -116,7 +116,7 @@ class _FakeSessionDB:
 
 
 def _install_fake_session_db(plugin_api, fake_db):
-    """Inject a fake SessionDB so ``scan_sessions`` finds it via its local import.
+    """Inject the shared SessionDB seam used by ``scan_sessions``.
 
     Uses the monkeypatch stashed on ``plugin_api`` by the fixture, so the
     ``sys.modules['hermes_state']`` swap is auto-restored at test teardown
@@ -125,6 +125,10 @@ def _install_fake_session_db(plugin_api, fake_db):
     fake_module = type(sys)("hermes_state")
     fake_module.SessionDB = lambda: fake_db
     plugin_api._test_monkeypatch.setitem(sys.modules, "hermes_state", fake_module)
+    fake_registry = type(sys)("hermes_state_registry")
+    fake_registry.acquire = lambda: fake_db
+    fake_registry.release_or_close = lambda db: db.close()
+    plugin_api._test_monkeypatch.setitem(sys.modules, "hermes_state_registry", fake_registry)
 
 
 def test_scan_sessions_default_scans_all_history_not_first_200(plugin_api):

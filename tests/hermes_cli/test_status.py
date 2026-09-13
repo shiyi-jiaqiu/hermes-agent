@@ -217,7 +217,7 @@ def test_show_status_reports_gateway_session_last_activity(monkeypatch, capsys, 
     from hermes_cli import status as status_mod
     import hermes_cli.auth as auth_mod
     import hermes_cli.gateway as gateway_mod
-    import hermes_state
+    import hermes_state_registry
     import time
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -243,7 +243,9 @@ def test_show_status_reports_gateway_session_last_activity(monkeypatch, capsys, 
         def close(self):
             return None
 
-    monkeypatch.setattr(hermes_state, "SessionDB", _FakeDB)
+    fake_db = _FakeDB()
+    monkeypatch.setattr(hermes_state_registry, "acquire", lambda: fake_db)
+    monkeypatch.setattr(hermes_state_registry, "release_or_close", lambda db: db.close())
 
     status_mod.show_status(SimpleNamespace(all=False, deep=False))
     output = capsys.readouterr().out

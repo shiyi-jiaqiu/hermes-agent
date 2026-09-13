@@ -190,8 +190,8 @@ def test_receipts_are_bounded_redacted_and_session_scoped(tmp_path, monkeypatch)
     with scoped_current_session_id("unrelated-session"):
         assert load_completed_results(recovered.id) == {}
         assert fresh.get(recovered.id) is None
-    from hermes_state import SessionDB
-    db = SessionDB()
+    from hermes_state_registry import acquire, release_or_close
+    db = acquire()
     try:
         db.create_session("owner-session", "cli")
         db.create_session("delegated-child", "subagent", parent_session_id="owner-session")
@@ -202,7 +202,7 @@ def test_receipts_are_bounded_redacted_and_session_scoped(tmp_path, monkeypatch)
         with scoped_current_session_id("owner-tip"):
             assert fresh.get(recovered.id).output_buffer == recovered.output_buffer
     finally:
-        db.close()
+        release_or_close(db)
     assert fresh.completion_queue.empty()
     for path in paths:
         expired = time.time() - receipts.RESULT_RETENTION_SECONDS - 1

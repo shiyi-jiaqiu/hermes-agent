@@ -772,14 +772,14 @@ class CLIInfoMixin:
                 i += 1
 
         try:
-            from hermes_state import SessionDB
+            from hermes_state_registry import acquire, release_or_close
             from agent.insights import InsightsEngine
-            db = SessionDB()
+            db = acquire()
             try:
                 engine = InsightsEngine(db)
                 print(engine.format_terminal(engine.generate(days=days, source=source)))
             finally:
-                db.close()
+                release_or_close(db)
         except Exception as e:
             print(f"  Error generating insights: {e}")
 

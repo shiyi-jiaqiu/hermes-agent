@@ -10,7 +10,6 @@ import importlib
 import io
 import json
 import sys
-from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -584,10 +583,15 @@ def _logs(_engine: HermesConsoleEngine, args: list[str]) -> str:
             session=ns.session, since=ns.since, component=ns.component))
 
 
+@contextlib.contextmanager
 def _session_db():
-    """``with _session_db() as db:`` — SessionDB closed on exit."""
-    from hermes_state import SessionDB
-    return closing(SessionDB())
+    """Borrow the process-wide state.db writer for one console command."""
+    from hermes_state_registry import acquire, release_or_close
+    db = acquire()
+    try:
+        yield db
+    finally:
+        release_or_close(db)
 
 
 def _sessions_list(_engine: HermesConsoleEngine, args: list[str]) -> str:

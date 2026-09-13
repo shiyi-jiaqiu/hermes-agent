@@ -19,7 +19,7 @@ import re
 import sqlite3
 import threading
 import time
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -186,17 +186,25 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
 
 @contextmanager
 def _transaction() -> Iterator[sqlite3.Connection]:
-    """Open a connection, commit/rollback on exit, and ALWAYS close it: ``sqlite3.Connection`` as a
-    context manager only commits/rolls back, so ``with _connect()`` alone leaks a connection (and its
-    WAL/SHM fds) per call — ``record_obligation`` runs on every final response; exhausts RLIMIT_NOFILE.
+    """Borrow the process-wide writer and commit/rollback without physically closing it.
 
-    On a long-running gateway that exhausts ``RLIMIT_NOFILE`` (the cron-ledger sibling of this bug was
-    #69567 / PR #69594). ``record_obligation`` runs on every outbound final response, so this ledger is the
-    highest-frequency leaker.
+    This ledger shares ``state.db`` with the long-lived transcript writer.  A second
+    sqlite connection's close can cancel process-scoped POSIX locks on WSL2, allowing an
+    external reader to unlink the live WAL generation.  The registry makes the physical
+    connection lifecycle process-wide; the SessionDB lock serializes this module's raw SQL
+    with its normal writes.
     """
-    conn = _connect()
-    with closing(conn), conn:
-        yield conn
+    from hermes_state_registry import acquire, release_or_close
+
+    db = acquire(_db_path())
+    try:
+        with db._lock:
+            db._halt_if_db_generation_changed()
+            _initialize_schema(db._conn)
+            with db._conn:
+                yield db._conn
+    finally:
+        release_or_close(db)
 
 
 def _start_time(pid: int) -> Optional[int]:

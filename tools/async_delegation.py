@@ -118,21 +118,24 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
 
 @contextmanager
 def _transaction() -> Iterator[sqlite3.Connection]:
-    """Open a connection, commit/rollback on exit, and ALWAYS close it (``with conn:``
-    alone leaks the connection and WAL/SHM fds until GC).
+    """Borrow the process-wide writer and commit/rollback without physically closing it.
 
-    ``sqlite3.Connection.__enter__``/``__exit__`` only commit or roll back the transaction; they do not
-    close the connection. Using ``with _connect()`` alone therefore leaks a connection — and its WAL/SHM
-    file descriptors — on every durable dispatch, completion, and delivery-claim, deferring the close to the
-    garbage collector. On a long-running gateway that exhausts ``RLIMIT_NOFILE`` (the cron-ledger sibling of
-    this bug was #69567 / PR #69594).
+    Async delegation shares ``state.db`` with the long-lived transcript writer.  On WSL2,
+    closing a second sqlite connection can cancel the process's main-file locks and expose
+    the live WAL to deletion by an external reader.  Serialize the ledger SQL on the shared
+    SessionDB connection instead.
     """
-    conn = _connect()
+    from hermes_state_registry import acquire, release_or_close
+
+    db = acquire(_db_path())
     try:
-        with conn:
-            yield conn
+        with db._lock:
+            db._halt_if_db_generation_changed()
+            _initialize_schema(db._conn)
+            with db._conn:
+                yield db._conn
     finally:
-        conn.close()
+        release_or_close(db)
 
 
 def _capture_routing_origin() -> Dict[str, Any]:

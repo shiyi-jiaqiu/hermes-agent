@@ -22,26 +22,28 @@ class _InsightsEngineStub:
 def _run_show_insights(command: str):
     cli_obj = HermesCLI.__new__(HermesCLI)
     db = MagicMock()
+    released = MagicMock()
     _InsightsEngineStub.calls = []
-    with patch("hermes_state.SessionDB", return_value=db), \
+    with patch("hermes_state_registry.acquire", return_value=db), \
+         patch("hermes_state_registry.release_or_close", released), \
          patch("agent.insights.InsightsEngine", _InsightsEngineStub):
         cli_obj._show_insights(command)
-    return _InsightsEngineStub.calls, db
+    return _InsightsEngineStub.calls, db, released
 
 
 def test_cli_insights_accepts_positional_days(capsys):
-    calls, db = _run_show_insights("/insights 7")
+    calls, db, released = _run_show_insights("/insights 7")
 
     assert calls == [{"days": 7, "source": None}]
-    db.close.assert_called_once()
+    released.assert_called_once_with(db)
     assert "days=7 source=None" in capsys.readouterr().out
 
 
 def test_cli_insights_keeps_days_flag_and_source(capsys):
-    calls, db = _run_show_insights("/insights --days 14 --source discord")
+    calls, db, released = _run_show_insights("/insights --days 14 --source discord")
 
     assert calls == [{"days": 14, "source": "discord"}]
-    db.close.assert_called_once()
+    released.assert_called_once_with(db)
     assert "days=14 source=discord" in capsys.readouterr().out
 
 

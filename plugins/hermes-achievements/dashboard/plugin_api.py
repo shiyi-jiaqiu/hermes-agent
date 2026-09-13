@@ -549,14 +549,16 @@ def scan_sessions(limit: Optional[int] = None, progress_callback: Optional[Any] 
     intermediate snapshots.
     """
     try:
-        from hermes_state import SessionDB
+        from hermes_state_registry import acquire, release_or_close
     except Exception as exc:
         return {"sessions": [], "aggregate": {}, "error": f"Could not import SessionDB: {exc}", "scan_meta": _scan_meta("failed", 0)}
 
     previous_sessions = load_checkpoint()["sessions"]  # load_checkpoint guarantees a dict
     reused = rescanned = 0
     db_limit = -1 if (limit is None or limit <= 0) else int(limit)
-    db = SessionDB()
+    # Dashboard scans share the process with its session API.  A separate writable
+    # SessionDB followed by close() can cancel that process's WAL-mode POSIX locks.
+    db = acquire()
     try:
         sessions_meta = db.list_sessions_rich(limit=db_limit, include_children=True, project_compression_tips=False)
         total_sessions = len(sessions_meta)
@@ -597,7 +599,7 @@ def scan_sessions(limit: Optional[int] = None, progress_callback: Optional[Any] 
                     pass  # Advisory — a broken publisher must never abort the scan.
         _write_json(CHECKPOINT_FILE, {"schema_version": 1, "generated_at": int(time.time()), "sessions": checkpoint_sessions})
     finally:
-        db.close()
+        release_or_close(db)
     return {
         "sessions": sessions,
         "aggregate": aggregate_stats(sessions),

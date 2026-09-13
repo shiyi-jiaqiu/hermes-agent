@@ -162,6 +162,18 @@ class GatewayAgentCacheMixin:
             return
         override: Dict[str, Any] = {k: persisted.get(k) for k in ("model", "provider", "base_url", "api_mode")}
         provider = persisted.get("provider")
+        if str(provider or "").strip().lower() == "custom":
+            # Older rows persisted the resolved billing class (``custom``), not the
+            # configured endpoint identity that owns key_env/key_cmd.  /resume clears
+            # the credential-bearing in-memory route, so heal the non-secret identity
+            # before resolving credentials.  A failed/ambiguous lookup deliberately
+            # retains the legacy direct-alias behaviour.
+            from hermes_cli.runtime_settings import durable_provider_identity
+            provider = override["provider"] = durable_provider_identity(
+                provider,
+                base_url=override.get("base_url") or "",
+                model=override.get("model") or "",
+            )
         if provider:
             # Re-resolve credentials for the persisted provider. On failure (e.g. credentials removed
             # since the switch) keep the credential-less override — _resolve_session_agent_runtime

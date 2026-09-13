@@ -101,6 +101,22 @@ def test_schema_init_preserves_shared_state_db_wal_mode(tmp_path):
         conn.close()
 
 
+def test_transaction_uses_registry_connection(tmp_path, monkeypatch):
+    """The runtime ledger must borrow state.db instead of closing a peer writer."""
+    from hermes_state_registry import acquire, close_all, stats
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    db = acquire(ad._db_path())
+    try:
+        assert stats()["total_refcounts"] == 1
+        with ad._transaction() as conn:
+            assert conn is db._conn
+            assert stats()["total_refcounts"] == 2
+        assert stats()["total_refcounts"] == 1
+    finally:
+        close_all()
+
+
 @pytest.mark.macos_only
 def test_connect_preserves_wal_and_applies_macos_durability_barriers(
     tmp_path, monkeypatch

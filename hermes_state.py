@@ -46,7 +46,8 @@ from hermes_state_telegram import SessionTelegramTopicsMixin
 from hermes_state_schema import SessionSchemaMixin
 import hermes_state_holders as _state_holders
 from hermes_state_dbfile import (
-    _canonical_sqlite_path, _connect_tracked_db, _fd_is_truly_unlinked, _prepare_connection_retirement,
+    _canonical_sqlite_path, _connect_tracked_db, _fd_is_truly_unlinked, _own_descriptor_for_identity,
+    _prepare_connection_retirement,
     _read_sqlite_application_id, _stat_sqlite_sidecar_identity,
     _watched_sqlite_sidecar_paths, has_invalid_sqlite_header_preopen, is_zeroed_state_db, quarantine_cross_process_lock,
     quarantine_invalid_state_db,
@@ -218,14 +219,19 @@ def _ensure_test_isolation(db_path: Path) -> None:
             )
 
 
-def _secure_state_db_files(db_path: Path, *, create_main: bool = False) -> None:
+def _secure_state_db_files(
+    db_path: Path, *, create_main: bool = False, existing_descriptors_only: bool = False,
+) -> None:
     """Create/tighten a writable state database and its sidecars to 0600.
 
     SQLite otherwise creates ``state.db``, ``-wal``, and ``-shm`` according to
     the process umask (commonly 0644 under 0022). Use file descriptors so a
     missing main database is private from its first byte and O_NOFOLLOW can
-    refuse a planted symlink. Read-only SessionDB attachments never call this
-    helper and remain observational.
+    refuse a planted symlink.  Once SQLite is connected, opening and closing
+    any of these same inodes would cancel this process's POSIX record locks;
+    ``existing_descriptors_only`` therefore fchmods descriptors SQLite already
+    owns and never opens a peer fd. Read-only SessionDB attachments never call
+    this helper and remain observational.
     """
     if os.name == "nt":
         return
@@ -237,6 +243,17 @@ def _secure_state_db_files(db_path: Path, *, create_main: bool = False) -> None:
             db_path.with_name(db_path.name + "-shm"),
         )
     ):
+        if existing_descriptors_only:
+            try:
+                st = path.stat()
+            except FileNotFoundError:
+                continue
+            fd = _own_descriptor_for_identity((st.st_dev, st.st_ino))
+            if fd is None:
+                logger.warning("Could not tighten permissions on open SQLite file %s", path)
+                continue
+            os.fchmod(fd, 0o600)
+            continue
         flags = os.O_RDONLY
         if index == 0 and create_main:
             flags = os.O_WRONLY | os.O_CREAT
@@ -667,7 +684,10 @@ class SessionDB(
             self._wal_active = mode == "wal" and _on_disk_journal_mode(conn) == "wal"
             # Existing WAL/SHM files may predate the main-file hardening;
             # normalize any sidecars that became visible during WAL setup.
-            _secure_state_db_files(self.db_path)
+            # Never open+close the connected database or its sidecars here: on
+            # POSIX that cancels SQLite's process-scoped WAL locks. Reuse the
+            # descriptors SQLite already owns instead.
+            _secure_state_db_files(self.db_path, existing_descriptors_only=True)
             apply_database_pragmas(conn, db_label="state.db")
             conn.execute("PRAGMA foreign_keys=ON")
             self._fts_cjk_loaded = load_fts5_cjk_extension(conn)

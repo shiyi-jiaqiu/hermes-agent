@@ -9,6 +9,8 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -226,6 +228,30 @@ def _posix_locks_on(paths):
         if lpid == pid and ino in inodes:
             held.add((ino, parts[1], parts[3], parts[6], parts[7]))
     return held
+
+
+def test_fresh_writer_keeps_dms_lock_through_external_reader(tmp_path):
+    """Post-connect permission hardening must not close a peer fd and cancel DMS."""
+    live = tmp_path / "state.db"
+    db = SessionDB(db_path=live)
+    try:
+        wal = Path(str(live) + "-wal")
+        before_identity = (wal.stat().st_dev, wal.stat().st_ino)
+        before = _posix_locks_on((live, Path(str(live) + "-shm")))
+        main_inode = live.stat().st_ino
+        assert any(lock[0] == main_inode for lock in before), (
+            "fresh WAL writer lost its main-file DMS lock during initialization"
+        )
+
+        subprocess.run(
+            [sys.executable, "-c", "import sqlite3,sys; sqlite3.connect(sys.argv[1]).execute('SELECT 1').fetchone()", str(live)],
+            check=True,
+        )
+
+        assert wal.exists()
+        assert (wal.stat().st_dev, wal.stat().st_ino) == before_identity
+    finally:
+        db.close()
 
 
 def test_identity_probe_does_not_cancel_live_posix_locks(tmp_path):

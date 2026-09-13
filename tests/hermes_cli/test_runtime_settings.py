@@ -7,7 +7,7 @@ import pytest
 from hermes_cli.model_switch import ModelSwitchResult
 from hermes_cli.runtime_settings import (
     RuntimeSettings, SettingsRequest, apply_settings, commit_settings, mode_request,
-    parse_mode_command, prepare_settings,
+    parse_mode_command, prepare_settings, stored_settings,
 )
 from hermes_state import SessionDB
 
@@ -92,6 +92,45 @@ def test_mode_passes_original_alias_to_resolver_including_endpoint_and_protocol(
     assert actual.persisted() == {"model": "gemini", "provider": "cpa", "base_url": "https://cpa.test/v1",
                                   "api_mode": "codex_responses", "reasoning": "high", "service_tier": "normal", "reasoning_inherited": False}
     assert actual.route()["capabilities"] == {"reasoning": True}
+
+
+def test_persisted_custom_route_keeps_named_credential_identity(monkeypatch):
+    """New writes retain the non-secret owner of key_env, never the resolved class alone."""
+    calls = []
+
+    def canonical(**kwargs):
+        calls.append(kwargs)
+        return "custom:cliproxy"
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.canonical_custom_identity", canonical)
+    settings = RuntimeSettings(
+        "local-flash", "custom", "http://127.0.0.1:8317/v1",
+        "chat_completions", api_key="must-not-persist",
+    )
+
+    persisted = settings.persisted()
+
+    assert persisted["provider"] == "custom:cliproxy"
+    assert "must-not-persist" not in json.dumps(persisted)
+    assert calls == [{"base_url": "http://127.0.0.1:8317/v1", "model": "local-flash"}]
+
+
+def test_legacy_stored_custom_route_heals_for_cli_resume(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.canonical_custom_identity",
+        lambda **kwargs: "custom:cliproxy",
+    )
+    restored = stored_settings({
+        "model": "local-flash",
+        "model_config": {
+            "settings_override": True,
+            "provider": "custom",
+            "base_url": "http://127.0.0.1:8317/v1",
+            "api_mode": "chat_completions",
+        },
+    })
+
+    assert restored["provider"] == "custom:cliproxy"
 
 
 @pytest.mark.parametrize("command", ["/quick", "/mode quick", "quick"])

@@ -2080,13 +2080,17 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
     if workspaces_root_path in _retagged_workspace_roots:
         return
     try:
-        from hermes_state import SessionDB
+        from hermes_state_registry import acquire, release_or_close
 
-        db = SessionDB()
+        # The dispatcher can run inside the long-lived gateway.  A second writable
+        # SessionDB followed by close() cancels this process's POSIX locks for the
+        # already-live writer (SQLite howtocorrupt §2.2), allowing another process to
+        # unlink its WAL/SHM generation.  Borrow the process-wide writer instead.
+        db = acquire()
         try:
             db.retag_kanban_worker_sessions(workspaces_root_path)
         finally:
-            db.close()
+            release_or_close(db)
         _retagged_workspace_roots.add(workspaces_root_path)
     except Exception as exc:
         _kb._log.debug("kanban worker: legacy session retag skipped (%s)", exc)
