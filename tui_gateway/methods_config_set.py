@@ -114,22 +114,47 @@ def _set_model(rid, params, key, value, session):
     if flags.errors:
         return _err(rid, 4002, flags.error_messages()[0])
     sid = params.get("session_id", "")
-    if session and session.get("running"):
+    if session is None:
+        # --once keeps its specific 5001; other sessionless model sets 4001 so
+        # --global cannot persist profile defaults before session.create (#106397:
+        # an older Desktop client sent a fresh-draft pick this way).
+        if flags.is_once:
+            result = _apply_model_switch(
+                "", {"agent": None}, value, confirm_expensive_model=confirmed,
+                parsed_flags=flags,
+            )
+        else:
+            return _err(rid, 4001, "config.set model requires a live session; "
+                        "use Settings -> Models to change the profile default")
+        return _kv(rid, key, result["value"], warning=result["warning"],
+                   confirm_required=result.get("confirm_required", False),
+                   confirm_message=result.get("confirm_message", ""),
+                   scope=result.get("scope", "session"), deferred=result.get("deferred", False))
+    if session.get("running"):
         return _stash_pending_model_switch(rid, key, value, session, confirmed, flags)
-    recovering = bool(session and session.get("agent") is None and session.get("agent_error") is not None)
-    if session and session.get("agent_build_started"):
+    recovering = session.get("agent") is None and session.get("agent_error") is not None
+    failed_ready = session.get("agent_ready") if recovering else None
+    if recovering:
+        if failed_ready is None:
+            return _err(rid, 5032, session.get("agent_error") or "agent initialization failed")
+        if not failed_ready.wait(timeout=30.0):
+            return _err(rid, 5032, "agent initialization timed out")
+        recovering = (
+            session.get("agent") is None and session.get("agent_error") is not None
+            and session.get("agent_ready") is failed_ready and failed_ready.is_set()
+        )
+    elif session.get("agent_build_started"):
         ready = session.get("agent_ready")
         if ready is not None and not ready.wait(timeout=30.0):
             return _err(rid, 5032, "agent initialization timed out")
-    if session and flags.is_once:
+    if flags.is_once:
         _start_agent_build(sid, session)
         if error := _cfgset_await_agent(session, rid):
             return error
-    with _session_profile_runtime_scope(session or {}):
-        result = _apply_model_switch(sid, session if session is not None else {"agent": None}, value,
+    with _session_profile_runtime_scope(session):
+        result = _apply_model_switch(sid, session, value,
                                      confirm_expensive_model=confirmed, parsed_flags=flags,
-                                     persist_override=True if session is None else None,
-                                     pin_session_override=session is not None)
+                                     pin_session_override=True)
     if recovering and not result.get("confirm_required"):
         _start_agent_build(sid, session)
         if error := _cfgset_await_agent(session, rid):
@@ -154,7 +179,7 @@ def _set_fast(rid, params, key, value, session):
     else:
         current_tier = _load_service_tier()
     if raw == "status":
-        return _kv(rid, key, {"priority": "fast", None: "normal"}.get(current_tier, current_tier))
+        return _kv(rid, key, {"priority": "fast", None: "normal", "": "normal"}.get(current_tier, current_tier))
     nv = _FAST_WORDS.get(raw, ("normal" if current_tier == "priority" else "fast") if raw in {"", "toggle"} else None)
     if nv is None:
         return _err(rid, 4002, f"unknown fast mode: {value}")
@@ -319,7 +344,10 @@ def _word_setters() -> dict:
                   lambda w: _write_config_key("display.tui_theme", w)),
         # _raw_word: 0/False/[] keep their text so the error names what was sent.
         "indicator": (_raw_word, INDICATOR_STYLES, "unknown indicator: {raw!r}; pick one of " + "|".join(INDICATOR_STYLES),
-                      lambda w: _write_config_key("display.tui_status_indicator", w))}
+                      lambda w: _write_config_key("display.tui_status_indicator", w)),
+        # Which engine the desktop voice button mounts; applies to the NEXT conversation.
+        "voice.voice_chat_mode": (_word, {"chained", "gpt-live"}, "unknown voice chat mode: {value}; pick chained|gpt-live",
+                                  lambda w: _write_config_key("voice.voice_chat_mode", w))}
 
 
 def _set_word(rid, params, key, value, session):
@@ -433,7 +461,7 @@ _CONFIG_SETTERS = {
     "approval_mode": _set_approval_mode, "approvals.mode": _set_word, "yolo": _set_yolo,
     "reasoning": _set_reasoning, "details_mode": _set_word, "thinking_mode": _set_word,
     "density": _set_toggle, "battery": _set_toggle, "theme": _set_word,
-    "statusbar": _set_toggle, "mouse": _set_toggle, "indicator": _set_word,
+    "statusbar": _set_toggle, "mouse": _set_toggle, "indicator": _set_word, "voice.voice_chat_mode": _set_word,
     "cwd": _set_cwd, "terminal.cwd": _set_cwd, "workdir": _set_cwd,
     "prompt": _set_prompt, "personality": _set_personality, "skin": _set_skin}
 

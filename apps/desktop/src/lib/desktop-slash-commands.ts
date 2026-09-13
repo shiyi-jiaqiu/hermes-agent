@@ -331,7 +331,7 @@ const NO_DESKTOP_SURFACE: Record<DesktopUnavailableReason, readonly string[]> = 
     '/verbose'
   ],
   messaging: ['/approve', '/deny'],
-  settings: ['/skills', '/pets'],
+  settings: ['/skills', '/pets', '/login'],
   advanced: [
     '/curator',
     '/fast',
