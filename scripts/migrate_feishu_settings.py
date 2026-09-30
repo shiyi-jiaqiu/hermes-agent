@@ -11,7 +11,7 @@ from pathlib import Path
 import shutil
 from datetime import datetime, timezone
 
-import yaml
+import hermes_yaml as yaml
 
 
 # These values belonged to the old implementation. They are migration input,

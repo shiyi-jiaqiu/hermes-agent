@@ -61,7 +61,11 @@ class _TUISettingsEndpoint:
             if db is None:
                 raise RuntimeError("Session database is unavailable")
             db.ensure_session(self.key, source=_session_source(session), model=self.read().model)
-            db.update_runtime_settings(self.key, settings.persisted())
+            payload = settings.persisted()
+            if session.get("follow_profile_config"):
+                payload["follow_profile_config"] = True
+                payload["composer_override_profile"] = session.get("composer_override_profile")
+            db.update_runtime_settings(self.key, payload)
 
     def publish(self, settings):
         import threading

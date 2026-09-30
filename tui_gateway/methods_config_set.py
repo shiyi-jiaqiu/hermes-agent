@@ -115,6 +115,7 @@ def _set_model(rid, params, key, value, session):
         return _err(rid, 4002, flags.error_messages()[0])
     sid = params.get("session_id", "")
     if session is None:
+
         # --once keeps its specific 5001; other sessionless model sets 4001 so
         # --global cannot persist profile defaults before session.create (#106397:
         # an older Desktop client sent a fresh-draft pick this way).
@@ -124,13 +125,14 @@ def _set_model(rid, params, key, value, session):
                 parsed_flags=flags,
             )
         else:
-            return _err(rid, 4001, "config.set model requires a live session; "
-                        "use Settings -> Models to change the profile default")
+            return _err(rid, 4001, "config.set model requires a live session; to change the "
+                        "profile default run /setup, or use the Models page (dashboard) / "
+                        "Settings -> Models (Desktop)")
         return _kv(rid, key, result["value"], warning=result["warning"],
                    confirm_required=result.get("confirm_required", False),
                    confirm_message=result.get("confirm_message", ""),
                    scope=result.get("scope", "session"), deferred=result.get("deferred", False))
-    if session.get("running"):
+    if session.get("running") or session.get("_compute_host_active"):
         return _stash_pending_model_switch(rid, key, value, session, confirmed, flags)
     recovering = session.get("agent") is None and session.get("agent_error") is not None
     failed_ready = session.get("agent_ready") if recovering else None
@@ -159,6 +161,7 @@ def _set_model(rid, params, key, value, session):
         _start_agent_build(sid, session)
         if error := _cfgset_await_agent(session, rid):
             return error
+
     return _kv(rid, key, result["value"], warning=result["warning"],
                confirm_required=result.get("confirm_required", False),
                confirm_message=result.get("confirm_message", ""), scope=result.get("scope", "session"),
@@ -166,7 +169,7 @@ def _set_model(rid, params, key, value, session):
 
 
 _FAST_WORDS = {"fast": "fast", "on": "fast", "normal": "normal", "off": "normal",
-               "auto": "auto", "cold": "cold"}
+               "auto": "auto", "cold": "cold", "ultrafast": "ultrafast"}
 
 
 def _set_fast(rid, params, key, value, session):
@@ -178,21 +181,32 @@ def _set_fast(rid, params, key, value, session):
         current_tier = session["create_service_tier_override"] or None  # pre-build pin beats global
     else:
         current_tier = _load_service_tier()
+    from agent.fast_mode import STATIC_TIERS, service_tier_word
     if raw == "status":
-        return _kv(rid, key, {"priority": "fast", None: "normal", "": "normal"}.get(current_tier, current_tier))
-    nv = _FAST_WORDS.get(raw, ("normal" if current_tier == "priority" else "fast") if raw in {"", "toggle"} else None)
+        return _kv(rid, key, service_tier_word(current_tier))
+    nv = _FAST_WORDS.get(raw, ("normal" if current_tier in STATIC_TIERS else "fast") if raw in {"", "toggle"} else None)
     if nv is None:
         return _err(rid, 4002, f"unknown fast mode: {value}")
+    overrides = None
+    if nv in ("fast", "ultrafast"):
+        from hermes_cli.models import resolve_fast_mode_overrides
+        if agent is not None:
+            target_model = getattr(agent, "model", None)
+        else:  # a pre-build session may carry a picked model (desktop draft): validate against THAT
+            session_override = (session or {}).get("model_override") or {}
+            target_model = (isinstance(session_override, dict) and session_override.get("model")) or _resolve_model()
+        if not target_model:
+            return _err(rid, 4002, "fast mode is not available without a selected model")
+        overrides = resolve_fast_mode_overrides(target_model, provider=getattr(agent, "provider", None),
+                                                base_url=getattr(agent, "base_url", None),
+                                                tier="ultrafast" if nv == "ultrafast" else None)
+        if overrides is None:
+            return _err(rid, 4002, f"{nv} mode is not available for this model")
     if session is not None and _word(params.get("scope")) != "global":
         from hermes_cli.runtime_settings import SettingsRequest
         with _session_profile_runtime_scope(session):
             applied = _apply_session_settings(params["session_id"], session, SettingsRequest(service_tier=nv), _load_cfg())
         return _kv(rid, key, nv) if applied.applied else _err(rid, 4002, applied.error)
-    if nv == "fast":
-        from hermes_cli.models import resolve_fast_mode_overrides
-        target_model = _resolve_model()
-        if not target_model or resolve_fast_mode_overrides(target_model) is None:
-            return _err(rid, 4002, "fast mode is not available for this model")
     _write_config_key("agent.service_tier", nv)
     if session is not None:
         from hermes_cli.runtime_settings import SettingsRequest
@@ -411,7 +425,10 @@ def _set_cwd(rid, params, key, value, session):
     if not os.path.isdir(cwd):
         return _err(rid, 4002, f"working directory does not exist: {raw}")
     _write_config_key("terminal.cwd", cwd)
-    os.environ["TERMINAL_CWD"] = cwd
+    # ``TERMINAL_CWD`` belongs to the launch process. Keep launch-profile updates live, but never
+    # publish an explicit or session-bound secondary profile's cwd into that process-wide carrier.
+    if Path(get_hermes_home()).resolve() == Path(_hermes_home).resolve():
+        os.environ["TERMINAL_CWD"] = cwd
     return _kv(rid, "terminal.cwd", cwd, cwd=cwd, branch=git_probe.branch(cwd))
 
 
@@ -465,12 +482,21 @@ _CONFIG_SETTERS = {
     "cwd": _set_cwd, "terminal.cwd": _set_cwd, "workdir": _set_cwd,
     "prompt": _set_prompt, "personality": _set_personality, "skin": _set_skin}
 
+# Keys whose sessionless branch writes a different, wider scope than the session branch (config.yaml's
+# agent.* for every surface, the process env every later child inherits). A non-empty session_id this
+# backend no longer holds (reaped / re-minted) is a stale session, not "no session": it answers 4001 so
+# the client resumes, never the global write. An explicit scope="global" is still honoured.
+_SESSION_SCOPED_KEYS = frozenset({"model", "fast", "yolo", "reasoning"})
+
 
 @method("config.set")
 @_profile_scoped
 def _(rid, params: dict) -> dict:
     key, value = params.get("key", ""), params.get("value", "")
     session = _sessions.get(params.get("session_id", ""))
+    if session is None and params.get("session_id") and key in _SESSION_SCOPED_KEYS \
+            and _word(params.get("scope")) != "global":
+        return _sess_nowait(params, rid)[1]
     handler = _CONFIG_SETTERS.get(key)
     if handler is None and key.startswith("details_mode."):
         handler = _set_details_section

@@ -134,14 +134,18 @@ def prepare_settings(current: RuntimeSettings, request: SettingsRequest, config:
             raise ValueError(f"Unknown reasoning effort: {request.reasoning}")
         target = replace(target, reasoning=level, reasoning_inherited=False)
     if request.service_tier is not None:
-        tiers = {"fast": "priority", "on": "priority", "priority": "priority",
-                 "normal": "normal", "off": "normal", "auto": "auto", "cold": "cold"}
+        from agent.fast_mode import SERVICE_TIER_WORDS, NORMAL_TIER_WORDS
+        tiers = {**SERVICE_TIER_WORDS, **{word: "normal" for word in NORMAL_TIER_WORDS}}
         if request.service_tier not in tiers:
             raise ValueError(f"Unknown service tier: {request.service_tier}")
         target = replace(target, service_tier=tiers[request.service_tier])
-    if target.service_tier == "priority":
+    from agent.fast_mode import STATIC_TIERS
+    if target.service_tier in STATIC_TIERS:
         from hermes_cli.models import resolve_fast_mode_overrides
-        if resolve_fast_mode_overrides(target.model, provider=target.provider, base_url=target.base_url) is None:
+        kwargs = {"provider": target.provider, "base_url": target.base_url}
+        if target.service_tier == "ultrafast":
+            kwargs["tier"] = "ultrafast"
+        if resolve_fast_mode_overrides(target.model, **kwargs) is None:
             raise ValueError("Fast mode is not available for the selected model")
     return target
 

@@ -137,6 +137,9 @@ class TestFeishuFallbackThreadRouting:
             return func(*args)
         adapter._run_blocking = _run_blocking_passthrough
 
+        async def _message_call(method, request):
+            return await _run_blocking_passthrough(getattr(mock_client.im.v1.message, method), request)
+
         # Call _send_raw_message with reply_to=None and thread_id in metadata
         import json
         result = await FeishuAdapter._send_raw_message(
@@ -146,6 +149,7 @@ class TestFeishuFallbackThreadRouting:
             payload=json.dumps({"text": "hello"}),
             reply_to=None,
             metadata={"thread_id": "omt_topic_abc"},
+            message_call=_message_call,
         )
 
         # Verify message.create was called (not message.reply)
@@ -172,3 +176,27 @@ class TestFeishuFallbackThreadRouting:
             f"Expected receive_id_type='thread_id', got '{receive_id_type}'"
         )
 
+
+class TestFallbackResendThreading:
+    """#103068: a full fallback resend replaces the preview, so it must land in
+    the originating thread; tail continuations keep their unthreaded delivery."""
+
+    @pytest.mark.asyncio
+    async def test_full_fallback_resend_threads_first_chunk_only(self):
+        adapter = _make_adapter(max_length=700)
+        adapter.send.side_effect = [
+            SimpleNamespace(success=True, message_id=f"full_{i}") for i in range(10)
+        ]
+        consumer = GatewayStreamConsumer(adapter, "chat_123", initial_reply_to_id="om_user_1")
+        consumer._message_id = "om_preview"
+        consumer._last_sent_text = "truncated snapshot"
+        consumer._already_sent = True
+        consumer._fallback_final_send = True
+
+        final = " ".join(["word"] * 400)  # not prefixed by the snapshot -> full resend
+        await consumer._send_fallback_final(final)
+
+        calls = adapter.send.await_args_list
+        assert len(calls) > 1
+        assert calls[0].kwargs["reply_to"] == "om_user_1"
+        assert all("reply_to" not in c.kwargs for c in calls[1:])

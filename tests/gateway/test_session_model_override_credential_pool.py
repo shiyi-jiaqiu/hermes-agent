@@ -46,4 +46,8 @@ def test_restored_route_resolves_its_own_credentials(monkeypatch):
     model, runtime = runner._resolve_session_agent_runtime(session_key="session")
     assert model == "gemini" and runtime["api_key"] == "cpa-key"
     assert runtime["api_mode"] == "codex_responses"
-    resolve.assert_called_once_with("custom:cpa", base_url="https://cpa.test/v1", model="gemini")
+    # Upstream resolves the override provider before applying its durable endpoint.
+    assert resolve.call_args_list == [
+        (("custom:cpa",), {"target_model": "gemini"}),
+        (("custom:cpa",), {"base_url": "https://cpa.test/v1", "model": "gemini"}),
+    ]

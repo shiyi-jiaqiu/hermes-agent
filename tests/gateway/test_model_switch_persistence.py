@@ -203,7 +203,7 @@ class TestOneTurnNeverPersisted:
 
     @staticmethod
     def _runner_with_store(tmp_path, monkeypatch):
-        import yaml as _yaml
+        import hermes_yaml as _yaml
 
         import gateway.run as gateway_run
         from gateway.run import GatewayRunner
@@ -301,7 +301,7 @@ class TestOneTurnNeverPersisted:
 
 @pytest.mark.asyncio
 async def test_global_alias_route_is_written_to_explicit_profile_path(tmp_path):
-    import yaml
+    import hermes_yaml as yaml
     from hermes_cli.model_switch import ModelSwitchResult
     from gateway.slash_commands_model import _persist_model_switch_to_config
     path = tmp_path / "config.yaml"

@@ -123,7 +123,8 @@ async def apply_gateway_global_tuning(runner, source, *, reasoning=None, service
         from hermes_constants import parse_reasoning_effort
         if reasoning is not None and parse_reasoning_effort(reasoning) is None:
             return False, "Invalid reasoning level; settings unchanged"
-        if service_tier is not None and service_tier not in {"fast", "priority", "normal", "auto", "cold"}:
+        from agent.fast_mode import SERVICE_TIER_WORDS, NORMAL_TIER_WORDS
+        if service_tier is not None and service_tier not in (SERVICE_TIER_WORDS.keys() | NORMAL_TIER_WORDS):
             return False, "Invalid service tier; settings unchanged"
         field, value = ("reasoning_effort", reasoning) if reasoning is not None else ("service_tier", service_tier)
         if not runner._save_gateway_config_key("agent." + field, value):
