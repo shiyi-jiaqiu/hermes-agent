@@ -176,7 +176,6 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashCommand('/pets')).toBe(false)
   })
 
-
   it('does not run /login on desktop before the catalog is loaded', () => {
     rememberDesktopCommandsCatalog(undefined)
     expect(isDesktopSlashCommand('/login')).toBe(false)
