@@ -134,7 +134,7 @@ def _apply_owner_settings(cli, connection, request):
             result = _owner_selection(cli, connection, endpoint.session_id, request, snapshot)
             if result.get("status") == "deferred":
                 return SettingsResult(endpoint.read(), False, "Selection queued for the next turn boundary")
-        except Exception as exc:
+        except (GatewayClientError, ValueError) as exc:
             return SettingsResult(endpoint.read(), False, settings_error(exc))
         # Committed: a failed refresh must not tell the caller the selection was rolled back.
         info = {**(snapshot.get("info") or {}), **{k: result[k] for k in ("model", "provider") if k in result}}
