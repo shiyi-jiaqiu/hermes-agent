@@ -81,8 +81,10 @@ class SettingsResult:
             return f"Settings unchanged: {self.error}"
         if not self.changed:
             return "Settings already active; no changes needed"
+        from agent.fast_mode import service_tier_word
         return (f"Settings saved for the next turn: {self.actual.model} ({self.actual.provider}) · "
-                f"Reasoning {self.actual.reasoning} · {self.actual.service_tier}")
+                f"Reasoning {self.actual.reasoning} · {self.actual.service_tier} "
+                f"({service_tier_word(self.actual.service_tier).upper()})")
 
 
 class SettingsEndpoint(Protocol):

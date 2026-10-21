@@ -20,7 +20,13 @@ def mode_rpc(monkeypatch, tmp_path):
     session = dict(session_key=sid, running=False, agent=agent, agent_ready=ready,
                    history_lock=threading.Lock(), create_reasoning_override=agent.reasoning_config,
                    create_service_tier_override="", slash_worker=None)
-    cfg = {"mode_presets": {"quick": {"model": "endpoint-alias", "reasoning": "high"}}}
+    cfg = {"mode_presets": {"quick": {"model": "endpoint-alias", "reasoning": "high"}},
+           "custom_providers": [{"name": "cpa", "base_url": "https://cpa.test/v1",
+                                 "api_key": "secret", "model": "target", "api_mode": "codex_responses"}]}
+    from hermes_cli.config import atomic_config_write
+    atomic_config_write(tmp_path / "config.yaml", cfg)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
     db = SessionDB(db_path=tmp_path / "state.db")
     @contextmanager
     def database(session):

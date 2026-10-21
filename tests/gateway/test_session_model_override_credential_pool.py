@@ -7,6 +7,19 @@ from unittest.mock import MagicMock
 from gateway.run import GatewayRunner, _credential_pool_for_provider
 
 
+def test_credential_pool_resolves_the_selected_endpoint_and_model(monkeypatch):
+    pool = object()
+    resolve = MagicMock(return_value={"credential_pool": pool})
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve)
+
+    assert _credential_pool_for_provider(
+        "custom:cpa", base_url="https://cpa.test/v1", model="gemini",
+    ) is pool
+    resolve.assert_called_once_with(
+        requested="custom:cpa", explicit_base_url="https://cpa.test/v1", target_model="gemini",
+    )
+
+
 def test_fast_session_override_includes_credential_pool(monkeypatch):
     runner = object.__new__(GatewayRunner)
     runner._session_model_overrides = {
@@ -49,5 +62,5 @@ def test_restored_route_resolves_its_own_credentials(monkeypatch):
     # Upstream resolves the override provider before applying its durable endpoint.
     assert resolve.call_args_list == [
         (("custom:cpa",), {"target_model": "gemini"}),
-        (("custom:cpa",), {"base_url": "https://cpa.test/v1", "model": "gemini"}),
+        (("custom:cpa",), {"base_url": "https://cpa.test/v1", "target_model": "gemini"}),
     ]

@@ -32,6 +32,16 @@ _FAST_SELECTIONS = {
     "ultrafast": ("ultrafast", "ultrafast", None),
 }
 
+
+def _fast_route_supports(model: str, runtime: dict, tier: Optional[str] = None) -> bool:
+    """The turn's own gate (``run_turn.py::_resolve_turn_agent_config``): a tier /fast accepts must be
+    one the session's next request actually carries, so proxies and other providers are refused."""
+    from hermes_cli.models import resolve_fast_mode_overrides
+
+    return resolve_fast_mode_overrides(
+        model, provider=runtime.get("provider"), base_url=runtime.get("base_url"), tier=tier) is not None
+
+
 # /reasoning display-toggle arguments -> show_reasoning value.
 _REASONING_DISPLAY_TOGGLES = {"show": True, "on": True, "hide": False, "off": False}
 
@@ -435,36 +445,66 @@ class GatewayModelCommandsMixin:
 
     async def _commit_model_switch_locked(self, result, ctx: _ModelSwitchContext, *, source, picker: bool) -> str:
         one_turn = False if picker else ctx.one_turn
-        # Global route switches use config.yaml as their sole durable authority;
-        # session selections keep the atomic, deferred settings operation.
-        if not one_turn and not ctx.persist_global:
-            from gateway.run import _load_gateway_config
-            from gateway.control.settings import apply_gateway_settings
-            from hermes_cli.runtime_settings import SettingsRequest
-            applied = await apply_gateway_settings(
-                self, source, SettingsRequest(result.new_model, result.target_provider, reasoning=ctx.reasoning_effort or None),
-                _load_gateway_config(config_path=ctx.config_path), resolver=lambda **kwargs: result)
-            if applied.applied:
-                self._record_switch_metrics(result, ctx, source)
-                if applied.changed:
-                    confirmation = await self._model_switch_confirmation(result, ctx, one_turn=False, picker=picker)
-                    return applied.text() + "\n" + confirmation
-            return applied.text()
-        async with self._session_state(ctx.session_key).persistent.settings_lock:
-            error = self._switch_cached_agent_model(result, ctx, picker)
-            if error is not None:
-                return error
+        from gateway.session_setting_commands import defer_local_model_pick, local_authority_live
+        authority, live = local_authority_live(self, source)
+        level = ""
+        if live is not None:
+            # A local session runs its frozen policy: the owner's canonical model mutation is the
+            # only commit, landing at the next turn boundary (this command is the running turn).
+            if one_turn:
+                return t("gateway.model.error_prefix", error=t("gateway.model.err_once_local"))
+            from hermes_constants import parse_reasoning_effort
+            effort = (ctx.reasoning_effort or "").strip().lower()
+            level = effort if parse_reasoning_effort(effort) is not None else ""
+            await asyncio.to_thread(defer_local_model_pick, authority, live, result, level)
             self._record_switch_metrics(result, ctx, source)
-            global_error = await self._record_model_switch(result, ctx, source=source, one_turn=one_turn, picker=picker)
-            confirmation = await self._model_switch_confirmation(
-                result, ctx, one_turn=one_turn, picker=picker, global_error=global_error)
-            if ctx.reasoning_effort and ctx.persist_global:
-                from gateway.run import _platform_config_key
-                tuning = self._apply_reasoning_selection(
-                    ctx.session_key, _platform_config_key(source.platform), ctx.reasoning_effort,
-                    persist_global=True)
-                return confirmation + "\n" + tuning
-            return confirmation
+            global_error = None
+            if ctx.persist_global:
+                try:
+                    await _persist_model_switch_to_config(result, ctx.config_path)
+                except Exception as e:
+                    logger.warning("Failed to persist model switch", exc_info=True)
+                    global_error = t("gateway.model.err_config_not_updated", error=str(e) or type(e).__name__)
+        else:
+            # Global route switches use config.yaml as their sole durable authority;
+            # session selections keep the atomic, deferred settings operation.
+            if not one_turn and not ctx.persist_global:
+                from gateway.run import _load_gateway_config
+                from gateway.control.settings import apply_gateway_settings
+                from hermes_cli.runtime_settings import SettingsRequest
+                applied = await apply_gateway_settings(
+                    self, source, SettingsRequest(result.new_model, result.target_provider, reasoning=ctx.reasoning_effort or None),
+                    _load_gateway_config(config_path=ctx.config_path), resolver=lambda **kwargs: result)
+                if applied.applied:
+                    self._record_switch_metrics(result, ctx, source)
+                    if applied.changed:
+                        confirmation = await self._model_switch_confirmation(result, ctx, one_turn=False, picker=picker)
+                        return applied.text() + "\n" + confirmation
+                return applied.text()
+            async with self._session_state(ctx.session_key).persistent.settings_lock:
+                error = self._switch_cached_agent_model(result, ctx, picker)
+                if error is not None:
+                    return error
+                self._record_switch_metrics(result, ctx, source)
+                global_error = await self._record_model_switch(
+                    result, ctx, source=source, one_turn=one_turn, picker=picker)
+        reply = await self._model_switch_confirmation(
+            result, ctx, one_turn=one_turn, picker=picker, global_error=global_error,
+        )
+        if level:
+            # Committed with the local pick: only the config write-through and the reply remain.
+            saved = (ctx.persist_global and global_error is None
+                     and self._save_gateway_config_key("agent.reasoning_effort", level))
+            reply += "\n" + t("gateway.reasoning.set_global" if saved else "gateway.reasoning.set_session",
+                              effort=level)
+        elif ctx.reasoning_effort and not one_turn:
+            # `/model X --reasoning <level>`: same applier as /reasoning, same scope as the pick.
+            # The record step already evicted the cached agent, so the pin lands on the rebuild.
+            from gateway.run import _platform_config_key
+            reply += "\n" + self._apply_reasoning_selection(
+                ctx.session_key, _platform_config_key(source.platform), ctx.reasoning_effort,
+                persist_global=ctx.persist_global and global_error is None)
+        return reply + ("\n" + t("gateway.model.local_next_turn") if live is not None else "")
 
     async def _send_model_picker(self, event: MessageEvent, source, adapter, session_key: str, listing_kwargs: dict, on_model_selected) -> bool:
         """Send the interactive /model picker; False when nothing was sent (text fallback). *source*
@@ -717,26 +757,43 @@ class GatewayModelCommandsMixin:
         self._set_session_reasoning_override(session_key, value)
         self._evict_cached_agent(session_key)
 
-    def _apply_reasoning_selection(self, session_key: str, platform_key: str, value: str,
-                                   persist_global: bool = False) -> str:
-        """Display controls and global-switch tuning; session tuning uses the settings operation."""
+    def _apply_reasoning_selection(
+        self, session_key: str, platform_key: str, value: str, persist_global: bool = False,
+    ) -> str:
+        """Local-session controls and global model tuning; messaging settings commit atomically."""
+        from hermes_constants import parse_reasoning_effort
+        from gateway.session_setting_commands import local_live_for_route
+
+        value = (value or "").strip().lower()
+        live = local_live_for_route(self, session_key)
+        show = _REASONING_DISPLAY_TOGGLES.get(value)
+        if show is not None:
+            if not self._save_gateway_config_key(f"display.platforms.{platform_key}.show_reasoning", show):
+                return "Configuration write failed; display unchanged"
+            self._show_reasoning = show
+            if live is not None:
+                live.show_reasoning = show
+            key = "gateway.reasoning.display_set_on" if show else "gateway.reasoning.display_set_off"
+            return t(key, platform=platform_key)
+        if value == "reset":
+            if persist_global:
+                return t("gateway.reasoning.reset_global_unsupported")
+            self._set_session_reasoning_override(session_key, None)
+            self._reasoning_config = self._load_reasoning_config()
+            self._evict_cached_agent(session_key)
+            return t("gateway.reasoning.reset_done")
+        parsed = parse_reasoning_effort(value)
+        if parsed is None:
+            return t("gateway.reasoning.unknown_arg", arg=value)
+        self._reasoning_config = parsed
         if persist_global:
-            from hermes_constants import parse_reasoning_effort
-            parsed = parse_reasoning_effort(value)
-            if parsed is None:
-                return t("gateway.reasoning.unknown_arg", arg=value)
-            self._reasoning_config = parsed
             if self._save_gateway_config_key("agent.reasoning_effort", value):
-                self._set_reasoning_override(session_key, None)
+                self._set_reasoning_override(session_key, parsed if live is not None else None)
                 return t("gateway.reasoning.set_global", effort=value)
             self._set_reasoning_override(session_key, parsed)
             return t("gateway.reasoning.set_global_save_failed", effort=value)
-        show = _REASONING_DISPLAY_TOGGLES[value]
-        if not self._save_gateway_config_key(f"display.platforms.{platform_key}.show_reasoning", show):
-            return "Configuration write failed; display unchanged"
-        self._show_reasoning = show
-        key = "gateway.reasoning.display_set_on" if show else "gateway.reasoning.display_set_off"
-        return t(key, platform=platform_key)
+        self._set_reasoning_override(session_key, parsed)
+        return t("gateway.reasoning.set_session", effort=value)
 
     async def _try_send_choice_picker(
         self, event: MessageEvent, session_key: str, title: str, choices: list, on_choice_selected,
@@ -746,10 +803,17 @@ class GatewayModelCommandsMixin:
         adapter = self._delivery_adapter_for(event.source)
         if adapter is None or getattr(type(adapter), "send_choice_picker", None) is None:
             return False
+        profile_home = self._resolve_profile_home_for_source(event.source)
+
+        async def scoped_choice(*args):
+            from gateway.run import _profile_runtime_scope
+            with _profile_runtime_scope(profile_home):
+                return await on_choice_selected(*args)
+
         try:
             result = await adapter.send_choice_picker(
                 chat_id=event.source.chat_id, title=title, choices=choices, session_key=session_key,
-                on_choice_selected=on_choice_selected, metadata=self._reply_metadata(event),
+                on_choice_selected=scoped_choice, metadata=self._reply_metadata(event),
             )
             return bool(getattr(result, "success", False))
         except Exception as e:
@@ -768,6 +832,9 @@ class GatewayModelCommandsMixin:
         _reasoning_source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
         session_key = self._session_key_for_source(_reasoning_source)
         self._show_reasoning = self._load_show_reasoning()
+        from gateway.session_setting_commands import local_live
+        if (_live := local_live(self, event.source)) is not None:
+            self._show_reasoning = getattr(_live, "show_reasoning", None) is True
         # Effective model (session /model override wins) so per-model reasoning_overrides display.
         _session_model = str(
             ((getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {}).get("model") or ""
@@ -776,6 +843,8 @@ class GatewayModelCommandsMixin:
             source=event.source, session_key=session_key, model=_session_model,
         )
         platform_key = _platform_config_key(event.source.platform)
+        if raw_args and _live is not None:
+            return self._apply_reasoning_selection(session_key, platform_key, args, persist_global)
         if raw_args and not persist_global and args not in _REASONING_DISPLAY_TOGGLES:
             from hermes_cli.runtime_settings import SettingsRequest
             selection = SettingsRequest(reset_reasoning=True) if args == "reset" else SettingsRequest(reasoning=args)
@@ -790,6 +859,7 @@ class GatewayModelCommandsMixin:
         # clamps is shown as "ultra (sends max on this route)" instead of a distinct level (#61634).
         from agent.reasoning_effort import effort_display_label
         from gateway.run import _load_gateway_config
+        from hermes_cli.codex_runtime_switch import get_current_runtime
         _session_route = ((getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {})
         _model_cfg = {}
         with contextlib.suppress(Exception):  # fail-open on config read errors, like /model does
@@ -797,6 +867,7 @@ class GatewayModelCommandsMixin:
         _route = (
             _session_route.get("provider") or _model_cfg.get("provider"),
             _session_model or _model_cfg.get("default") or _model_cfg.get("model"),
+            get_current_runtime({"model": _model_cfg}),
         )
         if rc is None:
             level, current_effort = t("gateway.reasoning.level_default"), "medium"
@@ -810,7 +881,7 @@ class GatewayModelCommandsMixin:
         scope = t("gateway.reasoning.scope_session") if has_session_override else t("gateway.reasoning.scope_global")
 
         async def _on_reasoning_choice(_chat_id: str, value: str) -> str:
-            if value in _REASONING_DISPLAY_TOGGLES:
+            if _live is not None or value in _REASONING_DISPLAY_TOGGLES:
                 return self._apply_reasoning_selection(session_key, platform_key, value)
             from hermes_cli.runtime_settings import SettingsRequest
             selection = SettingsRequest(reset_reasoning=True) if value == "reset" else SettingsRequest(reasoning=value)
@@ -833,24 +904,62 @@ class GatewayModelCommandsMixin:
             return None  # Picker sent — adapter handles the response
         return t("gateway.reasoning.status", level=level, scope=scope, display=display_state)
 
+    def _apply_fast_selection(self, session_key: str, value: str, persist: bool = False) -> str:
+        """Apply a /fast argument (typed or picked) and return the reply."""
+        selection = _FAST_SELECTIONS.get(value)
+        if selection is None:
+            return t("gateway.fast.unknown_arg", arg=value)
+        tier, saved_value, label_key = selection
+        label = t(label_key) if label_key else value.upper()
+        self._service_tier = tier
+        from gateway.session_setting_commands import local_live_for_route
+        if persist and self._save_gateway_config_key("agent.service_tier", saved_value):
+            if local_live_for_route(self, session_key) is not None:
+                # A local session runs its frozen tier, not config.yaml's: it takes the tier too.
+                self._set_session_service_tier_override(session_key, tier)
+            else:
+                self._set_session_service_tier_override(session_key, None, clear=True)  # global wins
+            self._evict_cached_agent(session_key)
+            return t("gateway.fast.saved", label=label)
+        # Session override — also the fallback after a failed config write (as /reasoning --global).
+        self._set_session_service_tier_override(session_key, tier)
+        self._evict_cached_agent(session_key)
+        return t("gateway.fast.session_only", label=label)
+
     async def _handle_fast_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /fast — the CLI Priority Processing toggle; session-scoped unless ``--global``
         (persists agent.service_tier, parity with /model)."""
-        from agent.fast_mode import service_tier_word
+        from agent.fast_mode import FAST_ARG_ALIASES, service_tier_word
         from gateway.run import _load_gateway_config, _resolve_gateway_model
-        from hermes_cli.models import model_supports_fast_mode, model_supports_ultrafast
 
         # The /reasoning parser strips --global (any position) and normalizes unicode dashes.
         args, persist_global = self._parse_reasoning_command_args(event.get_command_args().strip().lower())
-        session_key = self._session_key_for_source(event.source)
+        # Normalized like /model and /reasoning (#30479): the tier override must land under the key
+        # the next turn reads, and the eligibility check must see that turn's route.
+        source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
+        session_key = self._session_key_for_source(source)
         self._service_tier = self._resolve_session_service_tier(session_key=session_key)
-        effective_model = (self._session_model_override(session_key) or {}).get("model") or _resolve_gateway_model(_load_gateway_config())
-        if not model_supports_fast_mode(effective_model):
+        user_config = _load_gateway_config()
+        try:
+            # Off the loop: credential resolution can refresh an OAuth token, as the turn does.
+            model, runtime = await asyncio.to_thread(
+                self._resolve_session_agent_runtime, source=source, session_key=session_key, user_config=user_config)
+        except Exception:
+            # No usable route at all (the turn fails too): judge the configured model alone.
+            model, runtime = _resolve_gateway_model(user_config), {}
+        if not _fast_route_supports(model, runtime):
             return t("gateway.fast.not_supported")
-        ultrafast = model_supports_ultrafast(effective_model)
+        args = FAST_ARG_ALIASES.get(args, args)
+        from agent.codex_service_tiers import ultrafast_offered
+        ultrafast = ultrafast_offered(model, provider=runtime.get("provider"), base_url=runtime.get("base_url"),
+                                      access_token=runtime.get("api_key"))
         if args == "ultrafast" and not ultrafast:
-            return t("gateway.fast.ultrafast_not_supported", model=effective_model)
+            return t("gateway.fast.ultrafast_not_supported", model=model)
+        from gateway.session_setting_commands import local_live
+        live = local_live(self, source)
         if args and args != "status":
+            if live is not None:
+                return self._apply_fast_selection(session_key, args, persist_global)
             if not persist_global:
                 from hermes_cli.runtime_settings import SettingsRequest
                 return await self._apply_runtime_selection(event.source, SettingsRequest(service_tier=args))
@@ -860,6 +969,8 @@ class GatewayModelCommandsMixin:
         status = {"fast": t("gateway.fast.status_fast"), "normal": t("gateway.fast.status_normal")}.get(mode, mode)
 
         async def _on_fast_choice(_chat_id: str, value: str) -> str:
+            if live is not None:
+                return self._apply_fast_selection(session_key, value, persist_global)
             if not persist_global:
                 from hermes_cli.runtime_settings import SettingsRequest
                 return await self._apply_runtime_selection(event.source, SettingsRequest(service_tier=value))
